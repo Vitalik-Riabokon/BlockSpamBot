@@ -1,0 +1,168 @@
+import re
+
+from aiogram import types
+
+from . import config, state
+from .models import GroupPolicy, ModerationResult, ModerationStatus
+from .rules import (
+    AD_OFFER_KEYWORDS,
+    CTA_KEYWORDS,
+    HARD_ILLEGAL_KEYWORDS,
+    SCAM_JOB_KEYWORDS,
+    SUSPICIOUS_DOMAIN_WORDS,
+    mention_regex,
+    money_regex,
+    phone_regex,
+    simple_domain_regex,
+    url_regex,
+)
+
+
+def normalize_obfuscated_domain(candidate: str) -> str:
+    value = candidate.lower()
+    value = re.sub(r"\b(dot|точка|точкa|\[dot\]|\(dot\)|\{dot\})\b", ".", value)
+    value = re.sub(r"[\s\[\]\(\)\{\}\|,;:+]+", ".", value)
+    value = re.sub(r"[^a-z0-9\.\-]", "", value)
+    value = re.sub(r"\.+", ".", value).strip(".")
+    return value
+
+
+def contains_suspicious_domain(text: str) -> bool:
+    if url_regex.search(text):
+        return True
+
+    if simple_domain_regex.search(text):
+        return True
+
+    candidates = re.findall(r"[\w\-\[\]\(\)\{\}\s]{3,50}", text)
+    for candidate in candidates:
+        normalized = normalize_obfuscated_domain(candidate)
+        if normalized and simple_domain_regex.search(normalized):
+            return True
+        for word in SUSPICIOUS_DOMAIN_WORDS:
+            if word in normalized:
+                return True
+    return False
+
+
+def normalize_text_for_match(text: str) -> str:
+    cleaned = text.lower()
+    cleaned = cleaned.replace("ё", "е").replace("і", "i")
+    cleaned = re.sub(r"[\u200b-\u200f\u2060]", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def get_text(message: types.Message) -> str:
+    text = (message.text or "") + " " + (getattr(message, "caption", "") or "")
+    return text.strip()
+
+
+def has_any_keyword(text_lower: str, keywords: list[str] | set[str]) -> bool:
+    return any(keyword in text_lower for keyword in keywords)
+
+
+def is_authorized_ad(author: types.User, policy: GroupPolicy) -> bool:
+    return author.id in policy.authorized_user_ids
+
+
+def has_contact_signal(message: types.Message, text: str) -> bool:
+    if url_regex.search(text) or simple_domain_regex.search(text):
+        return True
+    if mention_regex.search(text):
+        return True
+    if phone_regex.search(text):
+        return True
+    if message.entities:
+        for entity in message.entities:
+            if entity.type in ("url", "text_link", "email", "phone_number"):
+                return True
+    return False
+
+
+def ad_intent(message: types.Message, text: str) -> tuple[bool, list[str]]:
+    text_lower = normalize_text_for_match(text)
+    reasons = []
+    signals = 0
+
+    if has_any_keyword(text_lower, AD_OFFER_KEYWORDS):
+        signals += 1
+        reasons.append("offer_keyword")
+    if has_any_keyword(text_lower, CTA_KEYWORDS):
+        signals += 1
+        reasons.append("cta_keyword")
+    if has_contact_signal(message, text_lower):
+        signals += 1
+        reasons.append("contact_or_link")
+
+    return signals >= 2, reasons
+
+
+def hard_illegal_detected(text_lower: str, policy: GroupPolicy) -> bool:
+    return has_any_keyword(text_lower, HARD_ILLEGAL_KEYWORDS) or has_any_keyword(
+        text_lower, policy.hard_block_extra_keywords
+    )
+
+
+def classify_message(message: types.Message, policy: GroupPolicy) -> ModerationResult:
+    text = get_text(message)
+    if not text:
+        return ModerationResult(ModerationStatus.SAFE_TEXT, 0, ["no_text"], False)
+
+    author = message.from_user
+    if not author:
+        return ModerationResult(ModerationStatus.SAFE_TEXT, 0, ["no_author"], False)
+
+    text_lower = normalize_text_for_match(text)
+    is_ad, ad_reasons = ad_intent(message, text_lower)
+
+    if not is_ad:
+        return ModerationResult(ModerationStatus.SAFE_TEXT, 0, ["not_ad"], False)
+
+    reasons = list(ad_reasons)
+    score = 0
+
+    if hard_illegal_detected(text_lower, policy):
+        reasons.append("hard_illegal")
+        return ModerationResult(ModerationStatus.AD_BLOCKED, 100, reasons, True)
+
+    if has_any_keyword(text_lower, SCAM_JOB_KEYWORDS):
+        score += 35
+        reasons.append("scam_job_pattern")
+
+    if contains_suspicious_domain(text_lower):
+        score += 25
+        reasons.append("suspicious_link")
+
+    if re.search(r"[^\w\s]{3,}", text_lower) and has_any_keyword(text_lower, SUSPICIOUS_DOMAIN_WORDS):
+        score += 20
+        reasons.append("obfuscation_like")
+
+    if money_regex.search(text_lower):
+        score += 8
+        reasons.append("money_claim")
+
+    pattern_score = state.spam_pattern_score(policy.group_id, author.id, text_lower)
+    if pattern_score:
+        score += pattern_score
+        reasons.append("spam_pattern")
+
+    reputation = state.user_reputation_score(policy.group_id, author.id)
+    if reputation:
+        score += reputation
+        reasons.append("user_reputation")
+
+    if score >= config.BLOCK_SCORE_THRESHOLD:
+        reasons.append("score_block")
+        return ModerationResult(ModerationStatus.AD_BLOCKED, score, reasons, True)
+
+    if score >= config.SUSPECT_SCORE_THRESHOLD:
+        reasons.append("score_suspect")
+        return ModerationResult(ModerationStatus.AD_SUSPECT, score, reasons, True)
+
+    if is_authorized_ad(author, policy):
+        reasons.append("authorized")
+        return ModerationResult(ModerationStatus.AD_ALLOWED, score, reasons, True)
+
+    reasons.append("pending_authorization")
+    return ModerationResult(ModerationStatus.AD_PENDING_AUTH, score, reasons, True)

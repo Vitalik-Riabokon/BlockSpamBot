@@ -1,0 +1,2 @@
+"""BayreuthUkraine moderation bot package."""
+
