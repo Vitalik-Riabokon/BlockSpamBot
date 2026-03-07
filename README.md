@@ -48,6 +48,7 @@ Telegram moderation bot with multi-group and multi-moderator isolation.
 ### Basic
 
 - `/start`
+- `/menu`
 - `/my_id`
 - `/chat_id`
 - `/mod_help`
@@ -81,15 +82,23 @@ If phrase has spaces and you need explicit groups, use delimiter:
 
 ### Alerts
 
-- `/set_review_alerts <on|off> [group_id|all]`
+- `/set_pending_alerts <on|off> [group_id|all]`
+- `/set_blocked_sound <on|off> [group_id|all]`
+- `/set_review_alerts <on|off> [group_id|all]` (alias to pending alerts)
 - `/pause_group [group_id|all]`
 - `/resume_group [group_id|all]`
 
 ## Important behavior
 
 - `whitelist` = trusted advertiser in that group:
-  - no review/pending push notifications for their non-critical ads
-  - hard-block (critical) ads are still deleted and moderators are notified
+  - no push notifications for their ads
+  - hard-block (critical) ads are still auto-deleted/muted and moderators are notified
+
+- Ads are separated into menu categories:
+  - `blocked` - auto-blocked ads (with unmute/ack workflow)
+  - `suspect` - requires manual approve/block
+  - `pending` - non-critical, not confirmed ads
+  - `confirmed` - ads from whitelist users (no push, still reviewable)
 
 ### Add moderator flow
 
