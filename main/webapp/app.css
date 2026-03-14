@@ -1,0 +1,152 @@
+:root {
+  --bg: #f4f6ef;
+  --card: #ffffff;
+  --ink: #1f2a1f;
+  --muted: #5a6a5a;
+  --line: #d8dfd1;
+  --accent: #255f38;
+  --accent-2: #89b46d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: linear-gradient(180deg, #eef2e7 0%, var(--bg) 100%);
+  color: var(--ink);
+  font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+}
+
+.container {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+h1 {
+  margin: 0 0 12px;
+  font-size: 22px;
+}
+
+.field-label {
+  display: block;
+  margin: 10px 0 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+select,
+input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 15px;
+  background: #fff;
+}
+
+.filters {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.chip {
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: 20px;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
+.chip.active {
+  border-color: var(--accent);
+  color: #fff;
+  background: var(--accent);
+}
+
+.meta {
+  margin: 8px 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.list {
+  display: grid;
+  gap: 10px;
+}
+
+.user-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+  padding: 12px;
+}
+
+.user-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.name {
+  font-weight: 700;
+}
+
+.badge {
+  border-radius: 12px;
+  padding: 2px 8px;
+  font-size: 12px;
+  border: 1px solid var(--line);
+}
+
+.badge.allowed {
+  border-color: var(--accent-2);
+  background: #edf6e8;
+}
+
+.badge.not-allowed {
+  background: #f4f4f4;
+}
+
+.details {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  margin-bottom: 8px;
+  word-break: break-word;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.btn {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: #fff;
+}
+
+.btn.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.pager {
+  display: flex;
+  justify-content: space-between;
+  margin: 12px 0 4px;
+}
+
+.pager button {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 12px;
+  background: #fff;
+}

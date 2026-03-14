@@ -25,6 +25,10 @@ if not BOT_TOKEN:
 
 TEST_MODE = os.getenv("TEST_MODE", "0").lower() in {"1", "true", "yes", "on"}
 
+WEBAPP_BASE_URL = os.getenv("WEBAPP_BASE_URL", "").strip()
+WEBAPP_HOST = os.getenv("WEBAPP_HOST", "127.0.0.1").strip()
+WEBAPP_PORT = int(os.getenv("WEBAPP_PORT", "8080"))
+
 # Thresholds
 SUSPECT_SCORE_THRESHOLD = int(os.getenv("SUSPECT_SCORE_THRESHOLD", "45"))
 BLOCK_SCORE_THRESHOLD = int(os.getenv("BLOCK_SCORE_THRESHOLD", "75"))
@@ -35,3 +39,11 @@ SUSPECT_WINDOW_SECONDS = int(os.getenv("SUSPECT_WINDOW_SECONDS", str(7 * 24 * 36
 WINDOW_SECONDS = int(os.getenv("WINDOW_SECONDS", "120"))
 FLOOD_COUNT = int(os.getenv("FLOOD_COUNT", "4"))
 DUPLICATE_WINDOW_SECONDS = int(os.getenv("DUPLICATE_WINDOW_SECONDS", "600"))
+
+# Split-message ad detection
+SPLIT_WINDOW_SECONDS = int(os.getenv("SPLIT_WINDOW_SECONDS", "120"))
+SPLIT_MAX_MESSAGES = int(os.getenv("SPLIT_MAX_MESSAGES", "4"))
+
+# Duplicate ad hard-block (only for messages already recognized as ad)
+AD_DUPLICATE_BLOCK_WINDOW_SECONDS = int(os.getenv("AD_DUPLICATE_BLOCK_WINDOW_SECONDS", "300"))
+AD_DUPLICATE_BLOCK_COUNT = int(os.getenv("AD_DUPLICATE_BLOCK_COUNT", "3"))

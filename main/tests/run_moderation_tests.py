@@ -8,8 +8,15 @@ from typing import List
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bot import config, state  # noqa: E402
-from bot.classifier import classify_message  # noqa: E402
+from bot.classifier import (  # noqa: E402
+    classify_message,
+    contains_suspicious_domain,
+    hard_illegal_detected,
+    has_any_keyword,
+    normalize_text_for_match,
+)
 from bot.models import GroupPolicy, ModerationStatus  # noqa: E402
+from bot.rules import CTA_KEYWORDS, SCAM_JOB_KEYWORDS, mention_regex, phone_regex  # noqa: E402
 
 
 @dataclass
@@ -67,19 +74,42 @@ class ResultRow:
     note: str
 
 
+_MSG_SEQ = 0
+
+
 def reset_runtime_state() -> None:
     state.user_message_times.clear()
     state.user_fingerprints.clear()
     state.user_suspect_times.clear()
     state.user_strikes.clear()
+    state.recent_messages.clear()
+    state.user_ad_fingerprints.clear()
+
+
+def split_chain_block(policy: GroupPolicy, recent_items: list[tuple[int, str]]) -> bool:
+    if len(recent_items) < config.SPLIT_MAX_MESSAGES:
+        return False
+    combined = " ".join([text for _, text in recent_items if text]).strip()
+    if not combined:
+        return False
+    normalized = normalize_text_for_match(combined)
+    has_contact = contains_suspicious_domain(normalized) or bool(mention_regex.search(normalized) or phone_regex.search(normalized))
+    has_cta = has_any_keyword(normalized, CTA_KEYWORDS)
+    has_scam_job = has_any_keyword(normalized, SCAM_JOB_KEYWORDS)
+    if hard_illegal_detected(normalized, policy) and has_contact:
+        return True
+    if has_scam_job and has_cta and has_contact:
+        return True
+    return False
 
 
 def evaluate(case: Case) -> tuple[str, str]:
+    global _MSG_SEQ
     if case.reset_state:
         reset_runtime_state()
 
     whitelist = case.whitelist or set()
-    authorized = case.authorized or set()
+    authorized = (case.authorized or set()) | whitelist
     hardwords = case.hardwords or set()
 
     policy = GroupPolicy(
@@ -94,21 +124,38 @@ def evaluate(case: Case) -> tuple[str, str]:
         from_user=FakeUser(id=case.user_id, full_name=f"User {case.user_id}"),
         chat=FakeChat(id=case.group_id),
     )
+    _MSG_SEQ += 1
+    recent_items = state.remember_recent_message(case.group_id, case.user_id, _MSG_SEQ, case.text)
 
     result = classify_message(msg, policy)
+    split_block = split_chain_block(policy, recent_items)
+    if result.status == ModerationStatus.SAFE_TEXT and split_block:
+        decision = "DELETE_BLOCK"
+        reasons = "status=AD_BLOCKED; reasons=split_chain_block; score=75"
+        return decision, reasons
+    if result.status != ModerationStatus.AD_BLOCKED and split_block:
+        decision = "DELETE_BLOCK"
+        reasons = f"status=AD_BLOCKED; reasons={','.join(result.reasons)},split_chain_block; score={max(result.score, config.BLOCK_SCORE_THRESHOLD)}"
+        return decision, reasons
+
+    if result.status != ModerationStatus.SAFE_TEXT:
+        dup_count = state.ad_duplicate_count(case.group_id, case.user_id, normalize_text_for_match(case.text))
+        if dup_count >= config.AD_DUPLICATE_BLOCK_COUNT and result.status != ModerationStatus.AD_BLOCKED:
+            decision = "DELETE_BLOCK"
+            reasons = f"status=AD_BLOCKED; reasons={','.join(result.reasons)},ad_duplicate_block; score={max(result.score, config.BLOCK_SCORE_THRESHOLD)}"
+            return decision, reasons
 
     in_whitelist = case.user_id in whitelist
     hard_block_hit = "hard_illegal" in result.reasons
+    duplicate_block_hit = "ad_duplicate_block" in result.reasons
 
     if result.status == ModerationStatus.SAFE_TEXT:
         decision = "ALLOW"
-    elif in_whitelist:
-        if result.status == ModerationStatus.AD_BLOCKED and hard_block_hit:
-            decision = "DELETE_HARD_WHITELIST_ALERT"
-        else:
-            decision = "ALLOW_WHITELIST_NO_ALERT"
     elif result.status == ModerationStatus.AD_BLOCKED:
-        decision = "DELETE_BLOCK"
+        if in_whitelist and not hard_block_hit and not split_block and not duplicate_block_hit:
+            decision = "ALLOW_WHITELIST_NO_ALERT"
+        else:
+            decision = "DELETE_BLOCK" if not in_whitelist else "DELETE_HARD_WHITELIST_ALERT"
     elif result.status == ModerationStatus.AD_SUSPECT:
         state.mark_suspect(case.group_id, case.user_id)
         if state.should_escalate_suspect(case.group_id, case.user_id):
@@ -118,7 +165,7 @@ def evaluate(case: Case) -> tuple[str, str]:
     elif result.status == ModerationStatus.AD_PENDING_AUTH:
         decision = "REVIEW_ALERT"
     elif result.status == ModerationStatus.AD_ALLOWED:
-        decision = "ALLOW_AUTHORIZED"
+        decision = "ALLOW_WHITELIST_NO_ALERT" if in_whitelist else "ALLOW_AUTHORIZED"
     else:
         decision = "UNKNOWN"
 
@@ -176,12 +223,12 @@ def build_cases() -> list[Case]:
         Case("C06", "C. Hard Block", "Whitelist user with hard block", "Казино бонус, пиши в лс @vip", "DELETE_HARD_WHITELIST_ALERT", user_id=wl_user, whitelist={wl_user}),
 
         # D. Suspect / gray job ads
-        Case("D01", "D. Gray Ads", "Remote job template", "Удаленка, 2 часа в день, без опыта, пиши в лс @jobfast", "REVIEW_ALERT"),
-        Case("D02", "D. Gray Ads", "Income claim", "Робота з дому, дохід 100€ в день, пишіть в директ @easywork", "REVIEW_ALERT"),
+        Case("D01", "D. Gray Ads", "Remote job template", "Удаленка, 2 часа в день, без опыта, пиши в лс @jobfast", "DELETE_BLOCK"),
+        Case("D02", "D. Gray Ads", "Income claim", "Робота з дому, дохід 100€ в день, пишіть в директ @easywork", "DELETE_BLOCK"),
         Case("D03", "D. Gray Ads", "No explicit contact still ad-intent", "Курс навчання, знижка сьогодні, реєструйся на site.de", "REVIEW_ALERT"),
 
         # E. Flood / duplicate logic
-        Case("E01", "E. Spam Pattern", "Base suspicious message #1", "Робота з дому, без досвіду, пиши в лс @xjob", "REVIEW_ALERT", user_id=4001, reset_state=True),
+        Case("E01", "E. Spam Pattern", "Base suspicious message #1", "Робота з дому, без досвіду, пиши в лс @xjob", "DELETE_BLOCK", user_id=4001, reset_state=True),
         Case("E02", "E. Spam Pattern", "Duplicate suspicious message #2", "Робота з дому, без досвіду, пиши в лс @xjob", "DELETE_BLOCK", user_id=4001, reset_state=False),
         Case("E03", "E. Spam Pattern", "Flood msg #1", "Послуга, пиши в лс @service", "REVIEW_ALERT", user_id=4010, reset_state=True),
         Case("E04", "E. Spam Pattern", "Flood msg #2", "Послуга, пиши в лс @service", "REVIEW_ALERT", user_id=4010, reset_state=False),
@@ -192,7 +239,7 @@ def build_cases() -> list[Case]:
         Case("F01", "F. Split Ads", "Part 1 (offer only)", "Робота онлайн 2 години на день", "ALLOW", user_id=5001, reset_state=True),
         Case("F02", "F. Split Ads", "Part 2 (CTA+contact)", "Пиши в лс @workhelp", "REVIEW_ALERT", user_id=5001, reset_state=False),
         Case("F03", "F. Split Ads", "Part 3 (money claim)", "Дохід 80€ в день", "ALLOW", user_id=5001, reset_state=False),
-        Case("F04", "F. Split Ads", "Part 4 (url only)", "https://job-fast.site", "ALLOW", user_id=5001, reset_state=False, note="Split tactic partially bypasses single-message ad_intent"),
+        Case("F04", "F. Split Ads", "Part 4 (url only)", "https://job-fast.site", "DELETE_BLOCK", user_id=5001, reset_state=False, note="Split chain should be blocked"),
 
         # G. Extra false-positive guard checks
         Case("G01", "G. False Positive Guard", "School parent message with emojis", "Матусі й татусі, покажіть дітям відео перед сном ❤️", "ALLOW"),
@@ -269,10 +316,10 @@ def build_cases() -> list[Case]:
         Case("I01", "I. Split Ad Tactics", "Split part 1", "Удаленка 2 часа в день", "ALLOW", user_id=9001, reset_state=True),
         Case("I02", "I. Split Ad Tactics", "Split part 2", "Доход 80 евро", "ALLOW", user_id=9001, reset_state=False),
         Case("I03", "I. Split Ad Tactics", "Split part 3", "Без опыта, обучаем", "ALLOW", user_id=9001, reset_state=False),
-        Case("I04", "I. Split Ad Tactics", "Split part 4", "Пиши в директ @workgo", "REVIEW_ALERT", user_id=9001, reset_state=False),
-        Case("I05", "I. Split Ad Tactics", "Split part 5", "https://jobbonus.site", "ALLOW", user_id=9001, reset_state=False, note="Gap: last fragment may bypass without offer+cta combo"),
-        Case("I06", "I. Split Ad Tactics", "Split casino part 1", "Занос на 140к баксов", "ALLOW", user_id=9002, reset_state=True),
-        Case("I07", "I. Split Ad Tactics", "Split casino part 2", "играю тут bonusspin.xo.je", "ALLOW", user_id=9002, reset_state=False, note="Gap: hard words may bypass if no ad_intent in message"),
+        Case("I04", "I. Split Ad Tactics", "Split part 4", "Пиши в директ @workgo", "DELETE_BLOCK", user_id=9001, reset_state=False),
+        Case("I05", "I. Split Ad Tactics", "Split part 5", "https://jobbonus.site", "DELETE_BLOCK", user_id=9001, reset_state=False),
+        Case("I06", "I. Split Ad Tactics", "Split casino part 1", "Занос на 140к баксов", "DELETE_BLOCK", user_id=9002, reset_state=True),
+        Case("I07", "I. Split Ad Tactics", "Split casino part 2", "играю тут bonusspin.xo.je", "DELETE_BLOCK", user_id=9002, reset_state=False),
     ]
 
     return cases

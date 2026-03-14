@@ -59,7 +59,12 @@ def get_text(message: types.Message) -> str:
 
 
 def has_any_keyword(text_lower: str, keywords: list[str] | set[str]) -> bool:
-    return any(keyword in text_lower for keyword in keywords)
+    normalized_text = normalize_text_for_match(text_lower)
+    for keyword in keywords:
+        normalized_keyword = normalize_text_for_match(str(keyword))
+        if normalized_keyword and normalized_keyword in normalized_text:
+            return True
+    return False
 
 
 def is_authorized_ad(author: types.User, policy: GroupPolicy) -> bool:
@@ -68,6 +73,8 @@ def is_authorized_ad(author: types.User, policy: GroupPolicy) -> bool:
 
 def has_contact_signal(message: types.Message, text: str) -> bool:
     if url_regex.search(text) or simple_domain_regex.search(text):
+        return True
+    if contains_suspicious_domain(text):
         return True
     if mention_regex.search(text):
         return True
@@ -115,18 +122,46 @@ def classify_message(message: types.Message, policy: GroupPolicy) -> ModerationR
 
     text_lower = normalize_text_for_match(text)
     is_ad, ad_reasons = ad_intent(message, text_lower)
+    reasons = list(ad_reasons)
+    score = 0
+    has_contact = has_contact_signal(message, text_lower)
+    has_cta = has_any_keyword(text_lower, CTA_KEYWORDS)
+    has_money = bool(money_regex.search(text_lower))
+    has_susp_domain = contains_suspicious_domain(text_lower)
+    has_susp_domain_word = has_any_keyword(text_lower, SUSPICIOUS_DOMAIN_WORDS)
+    has_scam_job = has_any_keyword(text_lower, SCAM_JOB_KEYWORDS)
+    has_job_core = has_any_keyword(
+        text_lower,
+        {
+            "робота з дому",
+            "удаленка",
+            "удалёнка",
+            "без опыта",
+            "без досвіду",
+            "дохід",
+            "доход",
+            "2 часа",
+            "2 години",
+        },
+    )
+
+    # Hard-illegal content is blocked when it also carries delivery/contact/CTA signal.
+    if hard_illegal_detected(text_lower, policy):
+        if has_contact or has_cta or has_money or has_susp_domain:
+            reasons.append("hard_illegal")
+            return ModerationResult(ModerationStatus.AD_BLOCKED, 100, reasons, True)
+    if has_susp_domain and has_susp_domain_word:
+        reasons.append("suspicious_domain_word")
+        return ModerationResult(ModerationStatus.AD_BLOCKED, 100, reasons, True)
 
     if not is_ad:
         return ModerationResult(ModerationStatus.SAFE_TEXT, 0, ["not_ad"], False)
 
-    reasons = list(ad_reasons)
-    score = 0
-
-    if hard_illegal_detected(text_lower, policy):
-        reasons.append("hard_illegal")
+    if has_scam_job and has_job_core and has_contact and (has_cta or has_money):
+        reasons.append("scam_job_hard")
         return ModerationResult(ModerationStatus.AD_BLOCKED, 100, reasons, True)
 
-    if has_any_keyword(text_lower, SCAM_JOB_KEYWORDS):
+    if has_scam_job:
         score += 35
         reasons.append("scam_job_pattern")
 

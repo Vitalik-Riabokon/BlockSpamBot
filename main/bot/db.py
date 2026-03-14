@@ -71,6 +71,16 @@ def init_db() -> None:
                 updated_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS group_users (
+                group_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                PRIMARY KEY (group_id, user_id),
+                FOREIGN KEY (group_id) REFERENCES groups(group_id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS ads (
                 ad_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 group_id INTEGER NOT NULL,
@@ -110,6 +120,15 @@ def init_db() -> None:
                 chat_id INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (moderator_id, group_id, category)
+            );
+
+            CREATE TABLE IF NOT EXISTS private_context_state (
+                user_id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                last_bot_message_id INTEGER,
+                last_user_message_id INTEGER,
+                selected_group_id INTEGER,
+                updated_at INTEGER NOT NULL
             );
             """
         )
@@ -405,6 +424,69 @@ def upsert_user(
             )
 
 
+def upsert_group_user(group_id: int, user_id: int) -> None:
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO group_users(group_id, user_id, first_seen_at, last_seen_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(group_id, user_id)
+            DO UPDATE SET last_seen_at=excluded.last_seen_at
+            """,
+            (group_id, user_id, now, now),
+        )
+
+
+def list_group_users_for_whitelist(
+    group_id: int,
+    search: str = "",
+    limit: int = 8,
+    offset: int = 0,
+) -> tuple[list[sqlite3.Row], int]:
+    normalized = (search or "").strip().lower()
+    like = f"%{normalized}%"
+    with _connect() as conn:
+        if normalized:
+            where_sql = """
+                gu.group_id = ? AND (
+                    CAST(u.user_id AS TEXT) LIKE ? OR
+                    LOWER(COALESCE(u.full_name, '')) LIKE ? OR
+                    LOWER(COALESCE(u.username, '')) LIKE ? OR
+                    LOWER(COALESCE(u.at_username, '')) LIKE ? OR
+                    LOWER(COALESCE(u.phone, '')) LIKE ?
+                )
+            """
+            params = (group_id, like, like, like, like, like)
+        else:
+            where_sql = "gu.group_id = ?"
+            params = (group_id,)
+
+        total_row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS cnt
+            FROM group_users gu
+            JOIN users u ON u.user_id = gu.user_id
+            WHERE {where_sql}
+            """,
+            params,
+        ).fetchone()
+        total = int(total_row["cnt"]) if total_row else 0
+
+        rows = conn.execute(
+            f"""
+            SELECT u.user_id, u.full_name, u.username, u.at_username, u.phone, u.status, gu.last_seen_at
+            FROM group_users gu
+            JOIN users u ON u.user_id = gu.user_id
+            WHERE {where_sql}
+            ORDER BY gu.last_seen_at DESC, u.user_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        ).fetchall()
+    return rows, total
+
+
 def set_user_status(user_id: int, status: str) -> None:
     now = _now()
     with _connect() as conn:
@@ -557,7 +639,13 @@ def update_ad_decision(
     record_ad_action(ad_id, gid, moderator_id, decision, note)
 
 
-def confirm_all(group_id: int, category: str, moderator_id: int) -> int:
+def confirm_all(
+    group_id: int,
+    category: str,
+    moderator_id: int,
+    decision: str = "approved",
+    action: str = "approved_all",
+) -> int:
     now = _now()
     with _connect() as conn:
         rows = conn.execute(
@@ -571,14 +659,14 @@ def confirm_all(group_id: int, category: str, moderator_id: int) -> int:
         conn.execute(
             """
             UPDATE ads
-            SET decision = 'approved', decided_by = ?, requires_action = 0, updated_at = ?, resolved_at = ?
+            SET decision = ?, decided_by = ?, requires_action = 0, updated_at = ?, resolved_at = ?
             WHERE group_id = ? AND category = ? AND requires_action = 1
             """,
-            (moderator_id, now, now, group_id, category),
+            (decision, moderator_id, now, now, group_id, category),
         )
 
     for ad_id in ids:
-        record_ad_action(ad_id, group_id, moderator_id, "approved_all", "approve_all")
+        record_ad_action(ad_id, group_id, moderator_id, action, "approve_all")
     return len(ids)
 
 
@@ -627,3 +715,92 @@ def latest_ads_history(limit: int = 200) -> list[sqlite3.Row]:
             """,
             (limit,),
         ).fetchall()
+
+
+def get_private_context_state(user_id: int) -> sqlite3.Row | None:
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT user_id, chat_id, last_bot_message_id, last_user_message_id, selected_group_id, updated_at
+            FROM private_context_state
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+
+
+def upsert_private_context_state(
+    user_id: int,
+    chat_id: int,
+    last_bot_message_id: int | None = None,
+    last_user_message_id: int | None = None,
+    selected_group_id: int | None = None,
+) -> None:
+    now = _now()
+    with _connect() as conn:
+        current = conn.execute(
+            "SELECT user_id, last_bot_message_id, last_user_message_id, selected_group_id FROM private_context_state WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if current is None:
+            conn.execute(
+                """
+                INSERT INTO private_context_state(user_id, chat_id, last_bot_message_id, last_user_message_id, selected_group_id, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, chat_id, last_bot_message_id, last_user_message_id, selected_group_id, now),
+            )
+            return
+
+        conn.execute(
+            """
+            UPDATE private_context_state
+            SET chat_id = ?,
+                last_bot_message_id = COALESCE(?, last_bot_message_id),
+                last_user_message_id = COALESCE(?, last_user_message_id),
+                selected_group_id = COALESCE(?, selected_group_id),
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (chat_id, last_bot_message_id, last_user_message_id, selected_group_id, now, user_id),
+        )
+
+
+def clear_private_context_bot_message(user_id: int) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE private_context_state SET last_bot_message_id = NULL, updated_at = ? WHERE user_id = ?",
+            (_now(), user_id),
+        )
+
+
+def list_private_contexts_older_than(age_seconds: int) -> list[sqlite3.Row]:
+    cutoff = _now() - age_seconds
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT user_id, chat_id, last_bot_message_id, last_user_message_id, selected_group_id, updated_at
+            FROM private_context_state
+            WHERE last_bot_message_id IS NOT NULL AND updated_at <= ?
+            ORDER BY updated_at ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+
+
+def set_selected_group(user_id: int, chat_id: int, group_id: int) -> None:
+    upsert_private_context_state(
+        user_id=user_id,
+        chat_id=chat_id,
+        selected_group_id=group_id,
+    )
+
+
+def get_selected_group(user_id: int) -> int | None:
+    row = get_private_context_state(user_id)
+    if row is None:
+        return None
+    value = row["selected_group_id"]
+    if value is None:
+        return None
+    return int(value)

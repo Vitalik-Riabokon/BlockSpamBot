@@ -25,6 +25,8 @@ Telegram moderation bot with multi-group and multi-moderator isolation.
 - `main/bot/classifier.py` - classification logic
 - `main/bot/actions.py` - delete/ban/notify actions
 - `main/bot/handlers.py` - aiogram handlers/router
+- `main/bot/webapp_server.py` - WebApp backend (live search + whitelist actions)
+- `main/webapp/` - WebApp frontend files
 
 ## Run
 
@@ -42,6 +44,8 @@ Telegram moderation bot with multi-group and multi-moderator isolation.
 - `BLOCK_SCORE_THRESHOLD` - block threshold
 - `SUSPECT_ESCALATION_COUNT` - suspect repeats before auto-block
 - `WINDOW_SECONDS`, `FLOOD_COUNT`, `DUPLICATE_WINDOW_SECONDS` - spam pattern tuning
+- `WEBAPP_BASE_URL` - public HTTPS base URL for Telegram WebApp button
+- `WEBAPP_HOST`, `WEBAPP_PORT` - local WebApp server bind settings
 
 ## Commands
 
@@ -87,6 +91,13 @@ If phrase has spaces and you need explicit groups, use delimiter:
 - `/set_review_alerts <on|off> [group_id|all]` (alias to pending alerts)
 - `/pause_group [group_id|all]`
 - `/resume_group [group_id|all]`
+
+## WebApp легалізації
+
+- У розділі `Налаштування` є кнопка `WebApp: Легалізація` (якщо задано `WEBAPP_BASE_URL`).
+- WebApp дає live-пошук по користувачах групи (ID, ім'я, username, телефон).
+- Можна надати або зняти легалізацію без зайвих повідомлень у приватному чаті.
+- Для роботи кнопки потрібен публічний HTTPS домен (локальний `http://127.0.0.1` Telegram не відкриє в клієнті).
 
 ## Important behavior
 

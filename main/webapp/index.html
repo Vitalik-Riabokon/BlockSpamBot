@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Легалізація Реклами</title>
+  <link rel="stylesheet" href="/webapp/app.css" />
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+  <main class="container">
+    <h1>Легалізація Реклами</h1>
+
+    <label class="field-label" for="groupSelect">Група</label>
+    <select id="groupSelect"></select>
+
+    <label class="field-label" for="searchInput">Пошук користувача</label>
+    <input id="searchInput" type="text" placeholder="ID, ім'я, @username, телефон" />
+
+    <div class="filters">
+      <button id="filterAll" class="chip active" type="button">Всі</button>
+      <button id="filterAllowed" class="chip" type="button">Легалізовані</button>
+      <button id="filterNotAllowed" class="chip" type="button">Не легалізовані</button>
+    </div>
+
+    <p id="meta" class="meta"></p>
+    <div id="list" class="list"></div>
+    <div class="pager">
+      <button id="prevBtn" type="button">Назад</button>
+      <button id="nextBtn" type="button">Далі</button>
+    </div>
+  </main>
+  <script src="/webapp/app.js"></script>
+</body>
+</html>
