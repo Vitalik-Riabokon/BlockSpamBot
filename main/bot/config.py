@@ -1,8 +1,11 @@
+"""Project configuration loaded from environment variables."""
+
 import os
 from pathlib import Path
 
 
 def load_local_env(path: str = ".env") -> None:
+    """Load a local `.env` file into process environment without overwriting existing values."""
     env_path = Path(path)
     if not env_path.exists():
         return
@@ -28,6 +31,14 @@ TEST_MODE = os.getenv("TEST_MODE", "0").lower() in {"1", "true", "yes", "on"}
 WEBAPP_BASE_URL = os.getenv("WEBAPP_BASE_URL", "").strip()
 WEBAPP_HOST = os.getenv("WEBAPP_HOST", "127.0.0.1").strip()
 WEBAPP_PORT = int(os.getenv("WEBAPP_PORT", "8080"))
+TUNNEL_NOTIFY_USER_ID = int(os.getenv("TUNNEL_NOTIFY_USER_ID", "0") or "0")
+TUNNEL_NOTIFY_ENABLED = os.getenv("TUNNEL_NOTIFY_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+CLOUDFLARED_AUTO_START = os.getenv("CLOUDFLARED_AUTO_START", "1").lower() in {"1", "true", "yes", "on"}
+CLOUDFLARED_BIN = os.getenv("CLOUDFLARED_BIN", "cloudflared").strip() or "cloudflared"
+CLOUDFLARED_TARGET_URL = os.getenv("CLOUDFLARED_TARGET_URL", f"http://{WEBAPP_HOST}:{WEBAPP_PORT}").strip()
+TUNNEL_LOG_PATH = os.getenv("TUNNEL_LOG_PATH", "main/data/cloudflared.out.log").strip() or "main/data/cloudflared.out.log"
+TUNNEL_LOG_POLL_SECONDS = float(os.getenv("TUNNEL_LOG_POLL_SECONDS", "1.0") or "1.0")
+BOT_LOCK_PATH = os.getenv("BOT_LOCK_PATH", "main/data/bot.lock").strip() or "main/data/bot.lock"
 
 # Thresholds
 SUSPECT_SCORE_THRESHOLD = int(os.getenv("SUSPECT_SCORE_THRESHOLD", "45"))

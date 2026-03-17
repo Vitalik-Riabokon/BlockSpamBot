@@ -1,3 +1,5 @@
+"""Telegram-side moderation actions such as delete, mute and unmute."""
+
 import logging
 from typing import Optional
 
@@ -9,6 +11,7 @@ from .models import ModerationResult
 
 
 async def log_action(chat: types.Chat, author: types.User, message: types.Message, result: ModerationResult) -> None:
+    """Write a moderation decision to application logs."""
     reason = ", ".join(result.reasons)
     logging.info(
         "Moderation: status=%s score=%s user=%s chat=%s msg_id=%s reasons=%s",
@@ -22,6 +25,7 @@ async def log_action(chat: types.Chat, author: types.User, message: types.Messag
 
 
 async def delete_message_safe(bot: Bot, chat_id: int, message_id: int) -> bool:
+    """Delete a Telegram message and suppress API errors into a boolean result."""
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
         return True
@@ -31,9 +35,7 @@ async def delete_message_safe(bot: Bot, chat_id: int, message_id: int) -> bool:
 
 
 async def apply_permanent_mute(bot: Bot, chat_id: int, user_id: int) -> bool:
-    """
-    Permanent mute: user stays in group but cannot send messages.
-    """
+    """Apply permanent chat restrictions while keeping the user in the group."""
     try:
         await bot.restrict_chat_member(
             chat_id=chat_id,
@@ -48,6 +50,7 @@ async def apply_permanent_mute(bot: Bot, chat_id: int, user_id: int) -> bool:
 
 
 async def apply_unmute(bot: Bot, chat_id: int, user_id: int) -> bool:
+    """Restore normal sending permissions for a previously muted user."""
     try:
         await bot.restrict_chat_member(
             chat_id=chat_id,
@@ -84,6 +87,7 @@ async def apply_block_action(
     result: ModerationResult,
     ad_id: Optional[int] = None,
 ) -> None:
+    """Execute the bot-side block flow for an automatically blocked message."""
     await log_action(chat, author, message, result)
 
     if not config.TEST_MODE:

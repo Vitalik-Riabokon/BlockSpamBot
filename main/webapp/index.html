@@ -3,32 +3,179 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Легалізація Реклами</title>
+  <title>BayreuthUkraine Moderation</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Sans+Condensed:wght@600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/webapp/app.css" />
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
 </head>
 <body>
-  <main class="container">
-    <h1>Легалізація Реклами</h1>
+  <div id="swipeOverlay" class="swipe-overlay" aria-hidden="true"></div>
+  <main class="shell">
+    <section class="hero">
+      <div class="hero-top">
+        <span class="eyebrow">BayreuthUkraine</span>
+        <select id="groupSelect" class="toolbar-field"></select>
+      </div>
 
-    <label class="field-label" for="groupSelect">Група</label>
-    <select id="groupSelect"></select>
+      <div id="identityBar" class="identity-bar">
+        <span id="myIdText" class="identity-text">Ваш id: -</span>
+        <button id="copyMyIdBtn" class="copy-id-btn" type="button" aria-label="Скопіювати id">⧉</button>
+      </div>
 
-    <label class="field-label" for="searchInput">Пошук користувача</label>
-    <input id="searchInput" type="text" placeholder="ID, ім'я, @username, телефон" />
+      <div class="current-settings">
+        <div class="setting-pill" id="settingModeration">Модерація: -</div>
+        <div class="setting-pill" id="settingPending">Не санкціоновані: -</div>
+        <div class="setting-pill" id="settingBlockedSound">Звук авто-блоків: -</div>
+      </div>
 
-    <div class="filters">
-      <button id="filterAll" class="chip active" type="button">Всі</button>
-      <button id="filterAllowed" class="chip" type="button">Легалізовані</button>
-      <button id="filterNotAllowed" class="chip" type="button">Не легалізовані</button>
+      <div class="top-tabs" role="tablist" aria-label="Розділи WebApp">
+        <button id="modeAdsBtn" class="mode-tab active" type="button">Реклами</button>
+        <button id="modeUsersBtn" class="mode-tab" type="button">Користувачі</button>
+        <button id="modeSettingsBtn" class="mode-tab" type="button">Налаштування</button>
+      </div>
+
+      <div id="emptyAccessState" class="empty-app-state" hidden>
+        <strong>Доступ до груп ще не налаштований</strong>
+        <p class="panel-meta">Надішліть свій id адміну або додайте бота в групу.</p>
+      </div>
+    </section>
+
+    <section id="adsView" class="view-block">
+      <section class="panel queue-panel">
+        <div class="section-top compact">
+          <div class="section-toggle" data-collapse-key="stats" role="button" tabindex="0" aria-label="Згорнути блок">
+            <strong>Типи реклам</strong>
+            <p class="panel-meta">Кількість невирішених кейсів по категоріях.</p>
+          </div>
+          <button id="toggleStatsBtn" class="collapse-btn" type="button" aria-label="Згорнути блок">˄</button>
+        </div>
+        <div id="statsWrap">
+          <div id="statsGrid" class="metrics"></div>
+        </div>
+      </section>
+
+      <section id="adsQueuePanel" class="panel queue-panel">
+        <div class="section-top compact">
+          <div class="section-toggle" data-collapse-key="adsQueue" role="button" tabindex="0" aria-label="Згорнути блок">
+            <strong id="queueTitle">Черга реклами</strong>
+            <p id="queueMeta" class="panel-meta"></p>
+          </div>
+          <div class="section-actions">
+            <button id="toggleAdsQueueBtn" class="collapse-btn" type="button" aria-label="Згорнути блок">˄</button>
+          </div>
+        </div>
+
+        <div id="adsQueueWrap">
+          <div id="bulkActions" class="bulk-actions section-toolbar"></div>
+          <div id="adsList" class="queue-list"></div>
+
+          <div class="pager">
+            <div class="pager-actions">
+              <button id="prevAdsBtn" class="btn ghost" type="button">Назад</button>
+              <button id="nextAdsBtn" class="btn ghost" type="button">Далі</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <section id="usersView" class="view-block" hidden>
+      <section class="panel queue-panel">
+        <div class="section-top compact">
+          <div class="section-toggle" data-collapse-key="users" role="button" tabindex="0" aria-label="Згорнути блок">
+            <strong>Користувачі групи</strong>
+            <p id="usersMeta" class="panel-meta"></p>
+          </div>
+          <div class="section-actions">
+            <button id="toggleUsersBtn" class="collapse-btn" type="button" aria-label="Згорнути блок">˄</button>
+          </div>
+        </div>
+
+        <div id="usersWrap">
+          <div class="section-toolbar">
+            <select id="usersFilterSelect" class="toolbar-field compact-select" aria-label="Фільтр користувачів">
+              <option value="all">Всі</option>
+              <option value="allowed">Легалізовані</option>
+              <option value="not_allowed">Не легалізовані</option>
+            </select>
+          </div>
+          <div class="search-row">
+            <input id="userSearchInput" class="search-input" type="text" placeholder="Пошук по ID, імені, @username, телефону" />
+          </div>
+
+          <div id="usersList" class="queue-list"></div>
+
+          <div class="pager">
+            <div class="pager-actions">
+              <button id="prevUsersBtn" class="btn ghost" type="button">Назад</button>
+              <button id="nextUsersBtn" class="btn ghost" type="button">Далі</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <section id="settingsView" class="view-block" hidden>
+      <section class="panel settings-panel">
+        <div class="section-top compact">
+          <div class="section-toggle" data-collapse-key="settings" role="button" tabindex="0" aria-label="Згорнути блок">
+            <strong>Налаштування групи</strong>
+            <p class="panel-meta">Налаштування застосовуються тільки до вибраної групи.</p>
+          </div>
+          <button id="toggleSettingsBtn" class="collapse-btn" type="button" aria-label="Згорнути блок">˄</button>
+        </div>
+        <div id="settingsWrap">
+          <div id="settingsCards" class="settings-cards"></div>
+        </div>
+      </section>
+    </section>
+
+    <div id="moderatorsModal" class="modal-backdrop" hidden>
+      <div class="modal-card">
+        <div class="modal-head">
+          <strong>Модератори групи</strong>
+          <button id="closeModeratorsModalBtn" class="collapse-btn" type="button" aria-label="Закрити">×</button>
+        </div>
+        <div class="search-row modal-search">
+          <input id="moderatorSearchInput" class="search-input" type="text" placeholder="Пошук по id, імені, @username, телефону" />
+        </div>
+        <div id="moderatorsList" class="queue-list"></div>
+      </div>
     </div>
 
-    <p id="meta" class="meta"></p>
-    <div id="list" class="list"></div>
-    <div class="pager">
-      <button id="prevBtn" type="button">Назад</button>
-      <button id="nextBtn" type="button">Далі</button>
+    <div id="triggersModal" class="modal-backdrop" hidden>
+      <div class="modal-card">
+        <div class="modal-head">
+          <strong>Тригери групи</strong>
+          <button id="closeTriggersModalBtn" class="collapse-btn" type="button" aria-label="Закрити">×</button>
+        </div>
+        <div class="top-tabs modal-tabs" role="tablist" aria-label="Типи тригерів">
+          <button id="triggerWordsTabBtn" class="mode-tab active" type="button">Слова</button>
+          <button id="triggerPhrasesTabBtn" class="mode-tab" type="button">Речення</button>
+        </div>
+        <div class="section-toolbar">
+          <select id="triggerSortSelect" class="toolbar-field compact-select" aria-label="Сортування тригерів">
+            <option value="alpha">За алфавітом</option>
+            <option value="newest">Спочатку нові</option>
+            <option value="oldest">Спочатку старі</option>
+          </select>
+        </div>
+        <div class="search-row modal-search">
+          <input id="triggerSearchInput" class="search-input" type="text" placeholder="Пошук по списку тригерів" />
+        </div>
+        <div class="search-row modal-search">
+          <input id="triggerInput" class="search-input" type="text" placeholder="Введіть слово або слова через пробіл" />
+        </div>
+        <div class="card-actions modal-actions">
+          <button id="saveTriggerBtn" class="btn ok" type="button">Додати</button>
+        </div>
+        <div id="triggersList" class="queue-list"></div>
+      </div>
     </div>
+
+    <button id="scrollTopBtn" class="scroll-top" type="button" aria-label="Вгору">↑</button>
   </main>
   <script src="/webapp/app.js"></script>
 </body>

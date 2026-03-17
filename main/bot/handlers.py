@@ -1,8 +1,11 @@
+"""Telegram bot handlers and private alert lifecycle for moderation flows."""
+
 import asyncio
 import html
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from urllib.parse import urlencode
 
 from aiogram import Bot, F, Router, types
 from aiogram.exceptions import TelegramAPIError
@@ -21,6 +24,8 @@ from .classifier import (
 )
 from .models import GroupPolicy, ModerationResult, ModerationStatus
 from .rules import CTA_KEYWORDS, SCAM_JOB_KEYWORDS, mention_regex, phone_regex
+from .tunnel_notifier import get_public_webapp_base_url
+from .config import TUNNEL_NOTIFY_USER_ID
 
 router = Router()
 
@@ -35,9 +40,7 @@ CATEGORY_ORDER = ["blocked", "suspect", "pending", "confirmed"]
 
 _PRIVATE_LAST_BOT_MESSAGE: dict[int, int] = {}
 _PRIVATE_LAST_USER_COMMAND: dict[int, int] = {}
-_PRIVATE_INPUT_FLOW: dict[int, tuple[str, int]] = {}
-_WHITELIST_SEARCH: dict[tuple[int, int], str] = {}
-_WHITELIST_OFFSET: dict[tuple[int, int], int] = {}
+_LAST_DAILY_PRIVATE_CLEANUP_DATE: date | None = None
 
 
 async def _send_context_message(
@@ -46,11 +49,7 @@ async def _send_context_message(
     reply_markup: types.InlineKeyboardMarkup | None = None,
     parse_mode: str | None = None,
 ) -> types.Message:
-    """
-    Private chat UX:
-    - keep only one contextual bot message
-    - delete previous command message(s)
-    """
+    """Send one contextual private message while replacing previous menu state."""
     if message.chat.type != "private" or not message.from_user:
         return await message.reply(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
 
@@ -68,6 +67,7 @@ async def _send_context_message(
             await bot.delete_message(chat_id=message.chat.id, message_id=old_bot_message_id)
         except TelegramAPIError:
             pass
+        db.untrack_private_bot_message(message.chat.id, old_bot_message_id)
 
     old_user_message_id = _PRIVATE_LAST_USER_COMMAND.get(user_id)
     if old_user_message_id is None and persisted is not None:
@@ -92,6 +92,7 @@ async def _send_context_message(
         parse_mode=parse_mode,
         disable_notification=True,
     )
+    db.track_private_bot_message(message.chat.id, user_id, sent.message_id, "context")
     _PRIVATE_LAST_BOT_MESSAGE[user_id] = sent.message_id
     _PRIVATE_LAST_USER_COMMAND[user_id] = message.message_id
     db.upsert_private_context_state(
@@ -103,7 +104,30 @@ async def _send_context_message(
     return sent
 
 
+async def _callback_answer_message(
+    callback: types.CallbackQuery,
+    text: str,
+    reply_markup: types.InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = None,
+) -> types.Message | None:
+    """Send a callback follow-up message and track it for private cleanup when needed."""
+    if not callback.message:
+        return None
+    kwargs = {
+        "text": text,
+        "reply_markup": reply_markup,
+        "parse_mode": parse_mode,
+    }
+    if callback.message.chat.type == "private":
+        kwargs["disable_notification"] = True
+    sent = await callback.message.answer(**kwargs)
+    if callback.from_user and callback.message.chat.type == "private":
+        db.track_private_bot_message(callback.message.chat.id, callback.from_user.id, sent.message_id, "callback")
+    return sent
+
+
 def _command_arg(message: types.Message) -> str:
+    """Extract raw command argument text after the command itself."""
     text = (message.text or "").strip()
     parts = text.split(maxsplit=1)
     if len(parts) < 2:
@@ -112,6 +136,7 @@ def _command_arg(message: types.Message) -> str:
 
 
 def _parse_bool(value: str) -> bool | None:
+    """Parse a user-facing on/off style token into boolean form."""
     normalized = value.strip().lower()
     if normalized in {"1", "on", "yes", "true", "enable", "enabled"}:
         return True
@@ -121,12 +146,14 @@ def _parse_bool(value: str) -> bool | None:
 
 
 def _reply_user_id(message: types.Message) -> int | None:
+    """Return replied user id when the command is used as a reply."""
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user.id
     return None
 
 
 def _parse_target_user_and_groupspec(message: types.Message) -> tuple[int | None, str]:
+    """Parse moderation target user id and optional group selector from a command."""
     raw = _command_arg(message)
     reply_id = _reply_user_id(message)
     if not raw:
@@ -144,13 +171,14 @@ def _parse_target_user_and_groupspec(message: types.Message) -> tuple[int | None
 
 
 def _resolve_selected_group_for_quick_action(user_id: int, chat_id: int) -> tuple[int | None, str | None]:
+    """Resolve the current selected group for private quick actions."""
     selected = db.get_selected_group(user_id)
     if selected is not None and db.is_moderator(selected, user_id):
         return selected, None
 
     groups = db.list_user_groups(user_id)
     if not groups:
-        return None, "У вас немає груп. Додайте бота в групу і виконайте /register_group."
+        return None, "У вас немає груп. Додайте бота в потрібну групу."
     if len(groups) > 1:
         return None, "У вас кілька груп. Спочатку оберіть групу через /menu."
 
@@ -160,46 +188,9 @@ def _resolve_selected_group_for_quick_action(user_id: int, chat_id: int) -> tupl
 
 
 async def _set_dynamic_private_commands(bot: Bot, user_id: int) -> None:
-    selected_group_id = db.get_selected_group(user_id)
-    if selected_group_id is None:
-        user_groups = db.list_user_groups(user_id)
-        if len(user_groups) == 1:
-            selected_group_id = int(user_groups[0]["group_id"])
-            db.set_selected_group(user_id, user_id, selected_group_id)
-    pause_desc = "Увімк/вимк модерацію обраної групи"
-    pending_desc = "Увімк/вимк сповіщення від не санкціонованих реклам"
-    blocked_desc = "Увімк/вимк звук від заблокованих реклам"
-
-    if selected_group_id is not None and db.is_moderator(selected_group_id, user_id):
-        paused = db.is_group_paused(selected_group_id)
-        pending_on = db.get_notify_pending(selected_group_id)
-        blocked_sound_on = db.get_blocked_alert_sound(selected_group_id)
-
-        pause_desc = (
-            "Увімкнути модерацію обраної групи"
-            if paused
-            else "Вимкнути модерацію обраної групи"
-        )
-        pending_desc = (
-            "Увімкнути сповіщення від не санкціонованих реклам"
-            if not pending_on
-            else "Вимкнути сповіщення від не санкціонованих реклам"
-        )
-        blocked_desc = (
-            "Увімкнути звук від заблокованих реклам"
-            if not blocked_sound_on
-            else "Вимкнути звук від заблокованих реклам"
-        )
-
+    """Set a minimal slash-command list for a private chat."""
     commands = [
         types.BotCommand(command="start", description="Початок роботи з ботом"),
-        types.BotCommand(command="menu", description="Головне меню модератора"),
-        types.BotCommand(command="my_groups", description="Мої підключені групи"),
-        types.BotCommand(command="my_id", description="Показати мій user id"),
-        types.BotCommand(command="mod_help", description="Довідка по командах"),
-        types.BotCommand(command="toggle_pending", description=pending_desc),
-        types.BotCommand(command="toggle_blocked_sound", description=blocked_desc),
-        types.BotCommand(command="pause_group", description=pause_desc),
     ]
     try:
         await bot.set_my_commands(commands, scope=types.BotCommandScopeChat(chat_id=user_id))
@@ -208,6 +199,7 @@ async def _set_dynamic_private_commands(bot: Bot, user_id: int) -> None:
 
 
 async def _is_group_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
+    """Return whether a Telegram user is currently admin/creator in the group."""
     try:
         member = await bot.get_chat_member(chat_id, user_id)
         return member.status in {"creator", "administrator"}
@@ -217,6 +209,7 @@ async def _is_group_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
 
 
 def _resolve_target_groups(message: types.Message, requester_id: int, group_spec: str) -> tuple[list[int], str | None]:
+    """Resolve one or more target groups for commands supporting group scoping."""
     if message.chat.type in ("group", "supergroup") and not group_spec:
         group_id = message.chat.id
         if not db.is_moderator(group_id, requester_id):
@@ -226,7 +219,7 @@ def _resolve_target_groups(message: types.Message, requester_id: int, group_spec
     user_groups = db.list_user_groups(requester_id)
     available_ids = [int(row["group_id"]) for row in user_groups]
     if not available_ids:
-        return [], "У вас немає прив'язаних груп. Спочатку /register_group в групі."
+        return [], "У вас немає прив'язаних груп. Додайте бота в потрібну групу."
 
     if not group_spec:
         if len(available_ids) == 1:
@@ -257,12 +250,14 @@ def _resolve_target_groups(message: types.Message, requester_id: int, group_spec
 
 
 def _utc_time(ts: int | None) -> str:
+    """Format a unix timestamp as UTC text for moderator-facing messages."""
     if not ts:
         return "-"
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _safe_username(username: str | None) -> str:
+    """Return a Telegram-style username with leading @ or fallback dash."""
     if not username:
         return "-"
     if username.startswith("@"):
@@ -271,183 +266,49 @@ def _safe_username(username: str | None) -> str:
 
 
 def _short_text(text: str, limit: int = 1400) -> str:
+    """Trim text for alert cards while preserving readability."""
     value = text.strip()
     if len(value) <= limit:
         return value
     return value[: limit - 3] + "..."
 
 
-def _profile_url(user_id: int) -> str:
-    return f"tg://user?id={user_id}"
+def _build_webapp_url(group_id: int | None = None, section: str = "ads", category: str | None = None, ad_id: int | None = None) -> str:
+    base = get_public_webapp_base_url()
+    if not base:
+        return ""
+    params: dict[str, str | int] = {"section": section}
+    if group_id is not None:
+        params["group_id"] = group_id
+    if category:
+        params["category"] = category
+    if ad_id is not None:
+        params["ad_id"] = ad_id
+    return f"{base}/webapp?{urlencode(params)}"
 
 
-def _extract_first_url(text: str) -> str | None:
-    match = re.search(r"https?://\S+", text)
-    if not match:
-        return None
-    return match.group(0)
-
-
-def _message_link(chat_id: int, message_id: int) -> str | None:
-    chat_str = str(chat_id)
-    if chat_str.startswith("-100"):
-        return f"https://t.me/c/{chat_str[4:]}/{message_id}"
-    return None
-
-
-def _group_row_to_label(row) -> str:
-    title = str(row["title"])
-    gid = int(row["group_id"])
-    return f"{title} ({gid})"
-
-
-def _menu_groups_kb(rows: list) -> types.InlineKeyboardMarkup:
-    keyboard: list[list[types.InlineKeyboardButton]] = []
-    for row in rows:
-        gid = int(row["group_id"])
-        keyboard.append([types.InlineKeyboardButton(text=_group_row_to_label(row), callback_data=f"menu:group:{gid}")])
-    keyboard.append([types.InlineKeyboardButton(text="Додати нову групу", callback_data="menu:add_group_help_global")])
-    return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-
-def _group_dashboard_kb(group_id: int, has_many_groups: bool) -> types.InlineKeyboardMarkup:
-    keyboard = [
-        [types.InlineKeyboardButton(text="Реклами", callback_data=f"menu:ads:{group_id}")],
-        [types.InlineKeyboardButton(text="Налаштування", callback_data=f"menu:settings:{group_id}")],
-    ]
-    return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-
-def _ads_menu_kb(group_id: int, counts: dict[str, int]) -> types.InlineKeyboardMarkup:
-    keyboard = [
-        [types.InlineKeyboardButton(text=f"{CATEGORY_LABELS['blocked']} ({counts.get('blocked', 0)})", callback_data=f"category:{group_id}:blocked")],
-        [types.InlineKeyboardButton(text=f"{CATEGORY_LABELS['suspect']} ({counts.get('suspect', 0)})", callback_data=f"category:{group_id}:suspect")],
-        [types.InlineKeyboardButton(text=f"{CATEGORY_LABELS['pending']} ({counts.get('pending', 0)})", callback_data=f"category:{group_id}:pending")],
-        [types.InlineKeyboardButton(text=f"{CATEGORY_LABELS['confirmed']} ({counts.get('confirmed', 0)})", callback_data=f"category:{group_id}:confirmed")],
-        [types.InlineKeyboardButton(text="Назад", callback_data=f"menu:group:{group_id}")],
-    ]
-    return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-
-def _settings_menu_kb(group_id: int, notify_pending: bool, blocked_sound: bool, paused: bool) -> types.InlineKeyboardMarkup:
-    webapp_url = ""
-    if config.WEBAPP_BASE_URL:
-        base = config.WEBAPP_BASE_URL.rstrip("/")
-        webapp_url = f"{base}/webapp?group_id={group_id}"
-
-    keyboard = [
-        [types.InlineKeyboardButton(text=f"Сповіщення від не санкціонованих реклам: {'УВІМКНЕНО' if notify_pending else 'ВИМКНЕНО'}", callback_data=f"toggle:pending:{group_id}")],
-        [types.InlineKeyboardButton(text=f"Звук від заблокованих реклам: {'УВІМКНЕНО' if blocked_sound else 'ВИМКНЕНО'}", callback_data=f"toggle:blocked_sound:{group_id}")],
-        [types.InlineKeyboardButton(text=("Відновити модерацію" if paused else "Призупинити модерацію"), callback_data=(f"toggle:resume:{group_id}" if paused else f"toggle:pause:{group_id}"))],
-        [types.InlineKeyboardButton(text="Додати модератора", callback_data=f"settings:add_moderator:{group_id}")],
-        [types.InlineKeyboardButton(text="Надати постійну легалізацію", callback_data=f"settings:add_whitelist:{group_id}")],
-        [types.InlineKeyboardButton(text="Назад", callback_data=f"menu:group:{group_id}")],
-    ]
-    if webapp_url:
-        keyboard.insert(
-            5,
-            [
-                types.InlineKeyboardButton(
-                    text="WebApp: Легалізація",
-                    web_app=types.WebAppInfo(url=webapp_url),
-                )
-            ],
-        )
-    return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-
-def _whitelist_state_key(moderator_id: int, group_id: int) -> tuple[int, int]:
-    return moderator_id, group_id
-
-
-def _format_user_for_whitelist(row) -> str:
-    full_name = str(row["full_name"] or "").strip()
-    if not full_name:
-        full_name = "Без імені"
-    username = _safe_username(row["at_username"] or row["username"])
-    return f"{full_name} ({int(row['user_id'])}) {username}"
-
-
-def _whitelist_picker_kb(
-    group_id: int,
-    rows: list,
-    offset: int,
-    total: int,
-) -> types.InlineKeyboardMarkup:
-    keyboard: list[list[types.InlineKeyboardButton]] = []
-    for row in rows:
-        user_id = int(row["user_id"])
-        keyboard.append(
-            [
-                types.InlineKeyboardButton(
-                    text=_format_user_for_whitelist(row),
-                    callback_data=f"whitelist:ask:{group_id}:{user_id}",
-                )
-            ]
-        )
-
-    nav_row: list[types.InlineKeyboardButton] = []
-    prev_offset = max(0, offset - 8)
-    next_offset = offset + 8
-    if offset > 0:
-        nav_row.append(
-            types.InlineKeyboardButton(text="< Назад", callback_data=f"whitelist:page:{group_id}:{prev_offset}")
-        )
-    if next_offset < total:
-        nav_row.append(
-            types.InlineKeyboardButton(text="Далі >", callback_data=f"whitelist:page:{group_id}:{next_offset}")
-        )
-    if nav_row:
-        keyboard.append(nav_row)
-
-    keyboard.append([types.InlineKeyboardButton(text="Пошук", callback_data=f"whitelist:search:{group_id}")])
-    keyboard.append([types.InlineKeyboardButton(text="Скинути пошук", callback_data=f"whitelist:reset:{group_id}")])
-    keyboard.append([types.InlineKeyboardButton(text="Назад", callback_data=f"menu:settings:{group_id}")])
-    return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-
-async def _render_whitelist_picker(
-    callback: types.CallbackQuery,
-    group_id: int,
-    moderator_id: int,
-    offset: int = 0,
-) -> None:
-    key = _whitelist_state_key(moderator_id, group_id)
-    query = _WHITELIST_SEARCH.get(key, "")
-    rows, total = db.list_group_users_for_whitelist(group_id, query, limit=8, offset=offset)
-    _WHITELIST_OFFSET[key] = max(0, offset)
-    query_line = f"Пошук: {query}" if query else "Пошук: (не задано)"
-    text = (
-        "Оберіть користувача для постійної легалізації.\n"
-        f"{query_line}\n"
-        f"Знайдено: {total}"
+def _main_menu_text(group_id: int) -> str:
+    group = db.get_group(group_id)
+    title = str(group["title"]) if group else str(group_id)
+    counts = db.get_unresolved_counts(group_id)
+    return "\n".join(
+        [
+            f"Назва групи: {title}",
+            "Стан реклам:",
+            f"• Проблемна: {counts.get('suspect', 0)}",
+            f"• Не санкціонована: {counts.get('pending', 0)}",
+            f"• Легалізовані: {counts.get('confirmed', 0)}",
+            f"• Заблоковані: {counts.get('blocked', 0)}",
+        ]
     )
-    keyboard = _whitelist_picker_kb(group_id, rows, offset, total)
-    try:
-        await callback.message.edit_text(text=text, reply_markup=keyboard)
-    except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
-    await callback.answer()
 
 
-def _category_view_ads(group_id: int, category: str) -> list:
-    if category == "blocked":
-        return db.list_ads(group_id, category, unresolved_only=False)
-    return db.list_ads(group_id, category, unresolved_only=True)
-
-
-def _settings_menu_text() -> str:
-    lines = [
-        "Налаштування для обраної групи:",
-        "• Сповіщення для не санкціонованих: вмикає/вимикає push модератору.",
-        "• Звук від заблокованих реклам: звук при авто-блокуванні.",
-        "• Пауза модерації: тимчасово зупиняє обробку повідомлень.",
-        "• Додати модератора: додавання за user_id.",
-        "• Надати постійну легалізацію: список користувачів + пошук.",
-    ]
-    if config.WEBAPP_BASE_URL:
-        lines.append("• WebApp: live-пошук і легалізація без зайвих повідомлень.")
-    return "\n".join(lines)
+def _main_menu_kb(group_id: int) -> types.InlineKeyboardMarkup:
+    webapp_url = _build_webapp_url(group_id=group_id, section="ads")
+    keyboard: list[list[types.InlineKeyboardButton]] = []
+    if webapp_url:
+        keyboard.append([types.InlineKeyboardButton(text="Відкрити застосунок", web_app=types.WebAppInfo(url=webapp_url))])
+    return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 def _ad_card_text(category: str, ad, idx: int, total: int, unresolved_count: int) -> str:
@@ -476,37 +337,20 @@ def _ad_card_text(category: str, ad, idx: int, total: int, unresolved_count: int
     )
 
 
-def _ad_actions_kb(group_id: int, category: str, ad, idx: int, total: int) -> types.InlineKeyboardMarkup:
+def _alert_nav_kb(group_id: int, category: str, ad, idx: int, total: int) -> types.InlineKeyboardMarkup:
     ad_id = int(ad["ad_id"])
-    user_id = int(ad["user_id"])
-    text = str(ad["text"] or "")
-    first_url = _extract_first_url(text) if category != "blocked" else None
-    message_url = _message_link(int(ad["source_chat_id"]), int(ad["source_message_id"])) if category != "blocked" else None
+    webapp_url = _build_webapp_url(group_id=group_id, section="ads", category=category, ad_id=ad_id)
     keyboard: list[list[types.InlineKeyboardButton]] = []
 
-    if category == "blocked":
+    if webapp_url:
         keyboard.append(
             [
-                types.InlineKeyboardButton(text="Розблокувати", callback_data=f"action:{group_id}:{category}:{ad_id}:unmute:{idx}"),
-                types.InlineKeyboardButton(text="Підтвердити", callback_data=f"action:{group_id}:{category}:{ad_id}:ack:{idx}"),
+                types.InlineKeyboardButton(
+                    text="Відкрити застосунок",
+                    web_app=types.WebAppInfo(url=webapp_url),
+                )
             ]
         )
-        keyboard.append([types.InlineKeyboardButton(text="Підтвердити всі", callback_data=f"allask:{group_id}:{category}")])
-    elif category == "suspect":
-        keyboard.append(
-            [
-                types.InlineKeyboardButton(text="Підтвердити", callback_data=f"action:{group_id}:{category}:{ad_id}:approve:{idx}"),
-                types.InlineKeyboardButton(text="Заблокувати", callback_data=f"action:{group_id}:{category}:{ad_id}:block:{idx}"),
-            ]
-        )
-    else:
-        keyboard.append(
-            [
-                types.InlineKeyboardButton(text="Підтвердити", callback_data=f"action:{group_id}:{category}:{ad_id}:approve:{idx}"),
-                types.InlineKeyboardButton(text="Заблокувати", callback_data=f"action:{group_id}:{category}:{ad_id}:block:{idx}"),
-            ]
-        )
-        keyboard.append([types.InlineKeyboardButton(text="Підтвердити всі", callback_data=f"allask:{group_id}:{category}")])
 
     if total > 1:
         prev_idx = max(0, idx - 1)
@@ -517,52 +361,13 @@ def _ad_actions_kb(group_id: int, category: str, ad, idx: int, total: int) -> ty
                 types.InlineKeyboardButton(text="Далі >", callback_data=f"nav:{group_id}:{category}:{next_idx}"),
             ]
         )
-
-    profile_buttons = [types.InlineKeyboardButton(text="Профіль", url=_profile_url(user_id))]
-    if message_url:
-        profile_buttons.append(types.InlineKeyboardButton(text="Відкрити в чаті", url=message_url))
-    if first_url:
-        profile_buttons.append(types.InlineKeyboardButton(text="Посилання", url=first_url))
-    keyboard.append(profile_buttons)
-    keyboard.append([types.InlineKeyboardButton(text="До категорій", callback_data=f"menu:ads:{group_id}")])
     return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def _alert_empty_kb(group_id: int, category: str) -> types.InlineKeyboardMarkup:
-    return types.InlineKeyboardMarkup(
-        inline_keyboard=[
-            [types.InlineKeyboardButton(text="OK", callback_data=f"ackalert:{group_id}:{category}")],
-            [types.InlineKeyboardButton(text="До категорій", callback_data=f"menu:ads:{group_id}")],
-        ]
-    )
-
-
-async def _render_category(callback: types.CallbackQuery, group_id: int, category: str, idx: int = 0) -> None:
-    if not callback.from_user:
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    db.set_selected_group(callback.from_user.id, callback.message.chat.id, group_id)
-
-    ads = _category_view_ads(group_id, category)
-    unresolved = db.get_unresolved_counts(group_id).get(category, 0)
-    if not ads:
-        text = f"<b>{html.escape(CATEGORY_LABELS.get(category, category))}</b>\nСписок порожній."
-        keyboard = types.InlineKeyboardMarkup(
-            inline_keyboard=[[types.InlineKeyboardButton(text="До категорій", callback_data=f"menu:ads:{group_id}")]]
-        )
-    else:
-        clamped = max(0, min(idx, len(ads) - 1))
-        ad = ads[clamped]
-        text = _ad_card_text(category, ad, clamped, len(ads), unresolved)
-        keyboard = _ad_actions_kb(group_id, category, ad, clamped, len(ads))
-
-    try:
-        await callback.message.edit_text(text=text, reply_markup=keyboard, parse_mode="HTML")
-    except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard, parse_mode="HTML")
-    await callback.answer()
+def _alert_ads_for_category(group_id: int, category: str) -> list:
+    if category == "confirmed":
+        return []
+    return db.list_ads(group_id, category, unresolved_only=True)
 
 
 async def _send_or_edit_private(
@@ -586,6 +391,11 @@ async def _send_or_edit_private(
             )
             return
         except TelegramAPIError:
+            try:
+                await bot.delete_message(chat_id=int(state_row["chat_id"]), message_id=int(state_row["message_id"]))
+            except TelegramAPIError:
+                pass
+            db.untrack_private_bot_message(int(state_row["chat_id"]), int(state_row["message_id"]))
             db.clear_alert_state(moderator_id, group_id, category)
 
     try:
@@ -597,6 +407,7 @@ async def _send_or_edit_private(
             disable_notification=disable_notification,
         )
         db.set_alert_state(moderator_id, group_id, category, sent.message_id, moderator_id)
+        db.track_private_bot_message(moderator_id, moderator_id, sent.message_id, f"alert:{category}")
     except TelegramAPIError:
         logging.info(
             "Cannot deliver alert to moderator=%s for group=%s. User likely did not /start in private.",
@@ -606,13 +417,14 @@ async def _send_or_edit_private(
 
 
 async def _refresh_alert_for_moderator(bot: Bot, moderator_id: int, group_id: int, category: str) -> None:
-    if category in {"blocked", "confirmed"}:
+    if category == "confirmed":
         row = db.get_alert_state(moderator_id, group_id, category)
         if row is not None:
             try:
                 await bot.delete_message(chat_id=int(row["chat_id"]), message_id=int(row["message_id"]))
             except TelegramAPIError:
                 pass
+            db.untrack_private_bot_message(int(row["chat_id"]), int(row["message_id"]))
             db.clear_alert_state(moderator_id, group_id, category)
         return
 
@@ -623,26 +435,21 @@ async def _refresh_alert_for_moderator(bot: Bot, moderator_id: int, group_id: in
                 await bot.delete_message(chat_id=int(row["chat_id"]), message_id=int(row["message_id"]))
             except TelegramAPIError:
                 pass
+            db.untrack_private_bot_message(int(row["chat_id"]), int(row["message_id"]))
             db.clear_alert_state(moderator_id, group_id, category)
         return
 
-    unresolved_ads = db.list_ads(group_id, category, unresolved_only=True)
+    unresolved_ads = _alert_ads_for_category(group_id, category)
     unresolved_count = len(unresolved_ads)
     if unresolved_count == 0:
-        row = db.get_alert_state(moderator_id, group_id, category)
-        if row is None:
-            return
-        try:
-            await bot.delete_message(chat_id=int(row["chat_id"]), message_id=int(row["message_id"]))
-        except TelegramAPIError:
-            pass
-        db.clear_alert_state(moderator_id, group_id, category)
         return
 
     ad = unresolved_ads[0]
     text = _ad_card_text(category, ad, 0, unresolved_count, unresolved_count)
-    keyboard = _ad_actions_kb(group_id, category, ad, 0, unresolved_count)
+    keyboard = _alert_nav_kb(group_id, category, ad, 0, unresolved_count)
     disable_notification = False
+    if category == "blocked":
+        disable_notification = not db.get_blocked_alert_sound(group_id)
 
     await _send_or_edit_private(
         bot=bot,
@@ -669,44 +476,132 @@ async def _clear_alerts_for_group(bot: Bot, group_id: int, category: str) -> Non
             await bot.delete_message(chat_id=int(row["chat_id"]), message_id=int(row["message_id"]))
         except TelegramAPIError:
             pass
+        db.untrack_private_bot_message(int(row["chat_id"]), int(row["message_id"]))
         db.clear_alert_state(moderator_id, group_id, category)
+
+
+def _daily_summary_disable_notification(group_id: int) -> bool:
+    counts = db.get_unresolved_counts(group_id)
+    if counts.get("suspect", 0) > 0:
+        return False
+    if counts.get("pending", 0) > 0 and db.get_notify_pending(group_id):
+        return False
+    if counts.get("blocked", 0) > 0 and db.get_blocked_alert_sound(group_id):
+        return False
+    return True
+
+
+def _pick_summary_group_for_user(user_id: int) -> int | None:
+    selected_group_id = db.get_selected_group(user_id)
+    if selected_group_id is not None and db.is_moderator(int(selected_group_id), user_id):
+        return int(selected_group_id)
+
+    groups = db.list_user_groups(user_id)
+    if not groups:
+        return None
+    return int(groups[0]["group_id"])
+
+
+async def _wipe_private_chat_history(bot: Bot, chat_id: int, window: int = 250) -> None:
+    """Delete a recent window of messages in private chat to hard-reset the bot conversation."""
+    try:
+        probe = await bot.send_message(chat_id=chat_id, text="…", disable_notification=True)
+    except TelegramAPIError:
+        return
+
+    start_message_id = max(1, int(probe.message_id) - window)
+    for message_id in range(int(probe.message_id), start_message_id - 1, -1):
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramAPIError:
+            continue
+
+
+async def _run_daily_private_cleanup(bot: Bot) -> None:
+    active_user_ids = db.list_private_users_with_activity()
+    chat_ids_to_wipe: set[int] = set()
+    for user_id in active_user_ids:
+        row = db.get_private_context_state(user_id)
+        if row and row["chat_id"] is not None:
+            chat_ids_to_wipe.add(int(row["chat_id"]))
+        else:
+            chat_ids_to_wipe.add(int(user_id))
+
+    tracked_messages = db.list_tracked_private_bot_messages()
+    for row in tracked_messages:
+        chat_id = int(row["chat_id"])
+        message_id = int(row["message_id"])
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramAPIError:
+            pass
+        db.untrack_private_bot_message(chat_id, message_id)
+
+    db.clear_all_alert_states()
+    db.clear_all_private_context_bot_messages()
+    db.clear_tracked_private_bot_messages()
+    _PRIVATE_LAST_BOT_MESSAGE.clear()
+
+    for chat_id in chat_ids_to_wipe:
+        await _wipe_private_chat_history(bot, chat_id)
+
+    for user_id in active_user_ids:
+        row = db.get_private_context_state(user_id)
+        chat_id = int(row["chat_id"]) if row and row["chat_id"] is not None else user_id
+        group_id = _pick_summary_group_for_user(user_id)
+
+        if group_id is None:
+            webapp_url = _build_webapp_url(section="ads")
+            keyboard_rows: list[list[types.InlineKeyboardButton]] = []
+            if webapp_url:
+                keyboard_rows.append(
+                    [types.InlineKeyboardButton(text="Відкрити застосунок", web_app=types.WebAppInfo(url=webapp_url))]
+                )
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text="Немає прив'язаних груп.\nДодайте бота в потрібну групу або надішліть свій id адміну.",
+                reply_markup=types.InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None,
+                disable_notification=True,
+            )
+            db.track_private_bot_message(chat_id, user_id, sent.message_id, "daily_state")
+            db.upsert_private_context_state(
+                user_id=user_id,
+                chat_id=chat_id,
+                last_bot_message_id=sent.message_id,
+                last_user_message_id=None,
+            )
+            _PRIVATE_LAST_BOT_MESSAGE[user_id] = sent.message_id
+            continue
+
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text=_main_menu_text(group_id),
+            reply_markup=_main_menu_kb(group_id),
+            disable_notification=_daily_summary_disable_notification(group_id),
+        )
+        db.track_private_bot_message(chat_id, user_id, sent.message_id, "daily_state")
+        db.upsert_private_context_state(
+            user_id=user_id,
+            chat_id=chat_id,
+            last_bot_message_id=sent.message_id,
+            last_user_message_id=None,
+            selected_group_id=group_id,
+        )
+        _PRIVATE_LAST_BOT_MESSAGE[user_id] = sent.message_id
 
 
 async def periodic_private_context_cleanup(
     bot: Bot,
-    ttl_seconds: int = 15 * 60,
     check_every_seconds: int = 60,
 ) -> None:
-    """
-    Periodically delete stale private context messages.
-    """
+    """Run daily private-message cleanup at 23:00 Europe/Berlin."""
+    global _LAST_DAILY_PRIVATE_CLEANUP_DATE
     while True:
         try:
-            stale_rows = db.list_private_contexts_older_than(ttl_seconds)
-            for row in stale_rows:
-                message_id = row["last_bot_message_id"]
-                if message_id is None:
-                    continue
-                try:
-                    await bot.delete_message(chat_id=int(row["chat_id"]), message_id=int(message_id))
-                except TelegramAPIError:
-                    pass
-                user_id = int(row["user_id"])
-                db.clear_private_context_bot_message(user_id)
-                groups = db.list_user_groups(user_id)
-                if groups:
-                    sent = await bot.send_message(
-                        chat_id=int(row["chat_id"]),
-                        text="Оберіть групу для керування:",
-                        reply_markup=_menu_groups_kb(groups),
-                        disable_notification=True,
-                    )
-                    db.upsert_private_context_state(
-                        user_id=user_id,
-                        chat_id=int(row["chat_id"]),
-                        last_bot_message_id=sent.message_id,
-                        last_user_message_id=None,
-                    )
+            now = datetime.now().astimezone()
+            if now.hour == 23 and (_LAST_DAILY_PRIVATE_CLEANUP_DATE is None or _LAST_DAILY_PRIVATE_CLEANUP_DATE != now.date()):
+                await _run_daily_private_cleanup(bot)
+                _LAST_DAILY_PRIVATE_CLEANUP_DATE = now.date()
         except Exception:
             logging.exception("private context cleanup failed")
         await asyncio.sleep(check_every_seconds)
@@ -720,23 +615,96 @@ async def _show_groups_menu(message: types.Message, intro: bool = False) -> None
 
     rows = db.list_user_groups(message.from_user.id)
     if not rows:
-        prefix = "Бот активний.\n\n" if intro else ""
-        keyboard = types.InlineKeyboardMarkup(
-            inline_keyboard=[[types.InlineKeyboardButton(text="Додати нову групу", callback_data="menu:add_group_help_global")]]
-        )
+        webapp_url = _build_webapp_url(section="ads")
+        keyboard_rows = []
+        if webapp_url:
+            keyboard_rows.append([types.InlineKeyboardButton(text="Відкрити застосунок", web_app=types.WebAppInfo(url=webapp_url))])
+        keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None
         await _send_context_message(
             message,
-            f"{prefix}Немає груп.\n1) Додайте бота в групу\n2) У групі виконайте /register_group",
+            "Немає прив'язаних груп.\nДодайте бота в потрібну групу або надішліть свій id адміну.",
             reply_markup=keyboard,
         )
         return
-    prefix = ""
-    if intro:
-        prefix = (
-            "Бот активний.\n"
-            "Кожен модератор має запустити /start у приваті.\n\n"
+    selected_group_id = db.get_selected_group(message.from_user.id)
+    if selected_group_id is None or not db.is_moderator(int(selected_group_id), message.from_user.id):
+        selected_group_id = int(rows[0]["group_id"])
+        db.set_selected_group(message.from_user.id, message.chat.id, selected_group_id)
+    await _send_context_message(message, _main_menu_text(selected_group_id), reply_markup=_main_menu_kb(selected_group_id))
+
+
+async def _refresh_private_context_for_user(bot: Bot, user_id: int) -> bool:
+    row = db.get_private_context_state(user_id)
+    if row is None:
+        return False
+
+    chat_id = int(row["chat_id"])
+    last_bot_message_id = row["last_bot_message_id"]
+    if last_bot_message_id is not None:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=int(last_bot_message_id))
+        except TelegramAPIError:
+            pass
+        db.untrack_private_bot_message(chat_id, int(last_bot_message_id))
+
+    selected_group_id = row["selected_group_id"]
+    if selected_group_id is not None and db.is_moderator(int(selected_group_id), user_id):
+        group = db.get_group(int(selected_group_id))
+        if group is not None:
+            text = _main_menu_text(int(selected_group_id))
+            keyboard = _main_menu_kb(int(selected_group_id))
+            sent = await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=keyboard,
+                disable_notification=True,
+            )
+            db.upsert_private_context_state(
+                user_id=user_id,
+                chat_id=chat_id,
+                last_bot_message_id=sent.message_id,
+                last_user_message_id=None,
+                selected_group_id=int(selected_group_id),
+            )
+            db.track_private_bot_message(chat_id, user_id, sent.message_id, "context")
+            _PRIVATE_LAST_BOT_MESSAGE[user_id] = sent.message_id
+            return True
+
+    groups = db.list_user_groups(user_id)
+    if not groups:
+        webapp_url = _build_webapp_url(section="ads")
+        rows = []
+        if webapp_url:
+            rows.append([types.InlineKeyboardButton(text="Відкрити застосунок", web_app=types.WebAppInfo(url=webapp_url))])
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text="Немає прив'язаних груп.\nДодайте бота в потрібну групу або надішліть свій id адміну.",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows) if rows else None,
+            disable_notification=True,
         )
-    await _send_context_message(message, f"{prefix}Оберіть групу для керування:", reply_markup=_menu_groups_kb(rows))
+        db.upsert_private_context_state(
+            user_id=user_id,
+            chat_id=chat_id,
+            last_bot_message_id=sent.message_id,
+            last_user_message_id=None,
+        )
+        db.track_private_bot_message(chat_id, user_id, sent.message_id, "context")
+        _PRIVATE_LAST_BOT_MESSAGE[user_id] = sent.message_id
+        return True
+
+    target_group_id = int(selected_group_id) if selected_group_id and db.is_moderator(int(selected_group_id), user_id) else int(groups[0]["group_id"])
+    db.set_selected_group(user_id, chat_id, target_group_id)
+    sent = await bot.send_message(chat_id=chat_id, text=_main_menu_text(target_group_id), reply_markup=_main_menu_kb(target_group_id), disable_notification=True)
+    db.upsert_private_context_state(
+        user_id=user_id,
+        chat_id=chat_id,
+        last_bot_message_id=sent.message_id,
+        last_user_message_id=None,
+        selected_group_id=target_group_id,
+    )
+    db.track_private_bot_message(chat_id, user_id, sent.message_id, "context")
+    _PRIVATE_LAST_BOT_MESSAGE[user_id] = sent.message_id
+    return True
 
 
 async def _can_enforce_group_actions(bot: Bot, chat_id: int) -> bool:
@@ -803,7 +771,7 @@ async def help_handler(message: types.Message) -> None:
                 "/start, /menu, /my_id, /chat_id, /my_groups",
                 "",
                 "Групи:",
-                "/register_group - реєстрація групи (виконати в групі)",
+                "Додавання нової групи: автоматично після додавання бота в групу",
                 "/delete_group [group_id] - видалити групу і вивести бота",
                 "/pause_group [group_id|all] - 1 команда для увімк/вимк модерації",
                 "",
@@ -928,7 +896,7 @@ async def my_groups(message: types.Message) -> None:
         return
     rows = db.list_user_groups(message.from_user.id)
     if not rows:
-        await _send_context_message(message, "Немає прив'язаних груп. Додайте бота в групу і виконайте /register_group.")
+        await _send_context_message(message, "Немає прив'язаних груп. Додайте бота в потрібну групу.")
         return
     lines = ["Ваші групи:"]
     for row in rows:
@@ -1244,30 +1212,36 @@ async def list_hardwords(message: types.Message) -> None:
 async def cb_menu_groups(callback: types.CallbackQuery) -> None:
     if not callback.from_user or not callback.message:
         return
-    _PRIVATE_INPUT_FLOW.pop(callback.from_user.id, None)
     await _set_dynamic_private_commands(callback.message.bot, callback.from_user.id)
     rows = db.list_user_groups(callback.from_user.id)
     if not rows:
-        text = (
-            "Немає прив'язаних груп.\n"
-            "1) Додайте бота в потрібну групу.\n"
-            "2) У групі виконайте /register_group."
-        )
-        keyboard = types.InlineKeyboardMarkup(
-            inline_keyboard=[[types.InlineKeyboardButton(text="Додати нову групу", callback_data="menu:add_group_help_global")]]
+        text = "Немає прив'язаних груп.\nДодайте бота в потрібну групу або надішліть свій id адміну."
+        webapp_url = _build_webapp_url(section="ads")
+        keyboard = (
+            types.InlineKeyboardMarkup(
+                inline_keyboard=[[types.InlineKeyboardButton(text="Відкрити застосунок", web_app=types.WebAppInfo(url=webapp_url))]]
+            )
+            if webapp_url
+            else None
         )
         try:
             await callback.message.edit_text(text=text, reply_markup=keyboard)
         except TelegramAPIError:
-            await callback.message.answer(text=text, reply_markup=keyboard)
+            await _callback_answer_message(callback, text=text, reply_markup=keyboard)
         await callback.answer()
         return
-    text = "Оберіть групу для керування:"
-    keyboard = _menu_groups_kb(rows)
+
+    selected_group_id = db.get_selected_group(callback.from_user.id)
+    if selected_group_id is None or not db.is_moderator(int(selected_group_id), callback.from_user.id):
+        selected_group_id = int(rows[0]["group_id"])
+        db.set_selected_group(callback.from_user.id, callback.message.chat.id, selected_group_id)
+
+    text = _main_menu_text(int(selected_group_id))
+    keyboard = _main_menu_kb(int(selected_group_id))
     try:
         await callback.message.edit_text(text=text, reply_markup=keyboard)
     except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
+        await _callback_answer_message(callback, text=text, reply_markup=keyboard)
     await callback.answer()
 
 
@@ -1279,8 +1253,8 @@ async def cb_menu_add_group_help_global(callback: types.CallbackQuery) -> None:
     text = (
         "Щоб додати нову групу:\n"
         "1) Додайте бота в потрібну групу.\n"
-        "2) У групі виконайте /register_group (адміном групи).\n"
-        "3) Поверніться в /menu і оберіть групу."
+        "2) Група прив’яжеться автоматично до того, хто додав бота.\n"
+        "3) Поверніться в застосунок і оберіть нову групу."
     )
     keyboard = types.InlineKeyboardMarkup(
         inline_keyboard=[[types.InlineKeyboardButton(text="Оновити список груп", callback_data="menu:groups")]]
@@ -1288,24 +1262,32 @@ async def cb_menu_add_group_help_global(callback: types.CallbackQuery) -> None:
     try:
         await callback.message.edit_text(text=text, reply_markup=keyboard)
     except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
+        await _callback_answer_message(callback, text=text, reply_markup=keyboard)
     await callback.answer()
 
 
-@router.callback_query(F.data == "menu:help_global")
-async def cb_help_global(callback: types.CallbackQuery) -> None:
-    if not callback.message:
+@router.callback_query(F.data == "tunnel:refresh_webapp")
+async def cb_tunnel_refresh_webapp(callback: types.CallbackQuery, bot: Bot) -> None:
+    if not callback.from_user or not callback.message:
         await callback.answer()
         return
-    text = "Скористайтеся /mod_help для повного списку команд."
-    keyboard = types.InlineKeyboardMarkup(
-        inline_keyboard=[[types.InlineKeyboardButton(text="До груп", callback_data="menu:groups")]]
-    )
-    try:
-        await callback.message.edit_text(text=text, reply_markup=keyboard)
-    except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
-    await callback.answer()
+    if callback.from_user.id != TUNNEL_NOTIFY_USER_ID:
+        await callback.answer("Немає доступу", show_alert=True)
+        return
+
+    refreshed = 0
+    for row in db.list_active_private_contexts():
+        try:
+            ok = await _refresh_private_context_for_user(bot, int(row["user_id"]))
+        except Exception:
+            logging.exception("Failed to refresh private context for user %s", row["user_id"])
+            ok = False
+        if ok:
+            refreshed += 1
+
+    await delete_message_safe(bot, callback.message.chat.id, callback.message.message_id)
+    db.untrack_private_bot_message(callback.message.chat.id, callback.message.message_id)
+    await callback.answer(f"WebApp оновлено для {refreshed} чатів", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("menu:group:"))
@@ -1325,538 +1307,25 @@ async def cb_menu_group(callback: types.CallbackQuery) -> None:
         await callback.answer("Немає доступу", show_alert=True)
         return
     db.set_selected_group(callback.from_user.id, callback.message.chat.id, group_id)
-    _PRIVATE_INPUT_FLOW.pop(callback.from_user.id, None)
-    await _set_dynamic_private_commands(callback.message.bot, callback.from_user.id)
-    rows = db.list_user_groups(callback.from_user.id)
-    group = db.get_group(group_id)
-    if group is None:
-        await callback.answer("Групу не знайдено", show_alert=True)
-        return
-    text = "\n".join(
-        [
-            f"Група: {group['title']} ({group_id})",
-            f"Модерація: {'ПРИЗУПИНЕНА' if group['is_paused'] else 'АКТИВНА'}",
-            f"Сповіщення для не підтверджених: {'УВІМКНЕНО' if group['notify_pending'] else 'ВИМКНЕНО'}",
-            f"Звук авто-блокувань: {'УВІМКНЕНО' if group['blocked_alert_sound'] else 'ВИМКНЕНО'}",
-        ]
-    )
-    keyboard = _group_dashboard_kb(group_id, len(rows) > 1)
-    try:
-        await callback.message.edit_text(text=text, reply_markup=keyboard)
-    except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("menu:ads:"))
-async def cb_menu_ads(callback: types.CallbackQuery) -> None:
-    if not callback.from_user:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[2])
-    except ValueError:
-        await callback.answer("Невірний group_id", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-
-    counts = db.get_unresolved_counts(group_id)
-    text = "\n".join(
-        [
-            "Розділ реклам:",
-            "• Заблоковані: уже авто-заблоковані, можна розблокувати або підтвердити.",
-            "• Проблемна: підозрілі, потрібне рішення модератора.",
-            "• Не санкціонована: адекватна реклама без легалізації.",
-            "• Легалізована: реклама від користувачів з постійною легалізацією.",
-        ]
-    )
-    keyboard = _ads_menu_kb(group_id, counts)
-    try:
-        await callback.message.edit_text(text=text, reply_markup=keyboard)
-    except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("menu:settings:"))
-async def cb_menu_settings(callback: types.CallbackQuery) -> None:
-    if not callback.from_user or not callback.message:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[2])
-    except ValueError:
-        await callback.answer("Невірний group_id", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    db.set_selected_group(callback.from_user.id, callback.message.chat.id, group_id)
-    _PRIVATE_INPUT_FLOW.pop(callback.from_user.id, None)
     await _set_dynamic_private_commands(callback.message.bot, callback.from_user.id)
     group = db.get_group(group_id)
     if group is None:
         await callback.answer("Групу не знайдено", show_alert=True)
         return
-    text = _settings_menu_text()
-    keyboard = _settings_menu_kb(
-        group_id=group_id,
-        notify_pending=bool(group["notify_pending"]),
-        blocked_sound=bool(group["blocked_alert_sound"]),
-        paused=bool(group["is_paused"]),
-    )
+    text = _main_menu_text(group_id)
+    keyboard = _main_menu_kb(group_id)
     try:
         await callback.message.edit_text(text=text, reply_markup=keyboard)
     except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
+        await _callback_answer_message(callback, text=text, reply_markup=keyboard)
     await callback.answer()
-
-
-async def _show_settings_after_toggle(callback: types.CallbackQuery, group_id: int) -> None:
-    group = db.get_group(group_id)
-    if group is None:
-        return
-    text = _settings_menu_text()
-    keyboard = _settings_menu_kb(
-        group_id=group_id,
-        notify_pending=bool(group["notify_pending"]),
-        blocked_sound=bool(group["blocked_alert_sound"]),
-        paused=bool(group["is_paused"]),
-    )
-    try:
-        await callback.message.edit_text(text=text, reply_markup=keyboard)
-    except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
-
-
-@router.callback_query(F.data.startswith("menu:help:"))
-async def cb_menu_help(callback: types.CallbackQuery) -> None:
-    if not callback.from_user:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[2])
-    except ValueError:
-        await callback.answer("Невірний group_id", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    text = "\n".join(
-        [
-            "Коротко по розділах:",
-            "- Заблоковані: авто-блоки, можна розблокувати або OK.",
-            "- Підозрілі: підтвердити або заблокувати.",
-            "- Адекватні не підтверджені: підтвердити/блокувати/підтвердити всі.",
-            "- Від підтверджених: без push, але доступні в меню.",
-        ]
-    )
-    keyboard = types.InlineKeyboardMarkup(
-        inline_keyboard=[[types.InlineKeyboardButton(text="Назад", callback_data=f"menu:group:{group_id}")]]
-    )
-    try:
-        await callback.message.edit_text(text=text, reply_markup=keyboard)
-    except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("menu:stats:"))
-async def cb_menu_stats(callback: types.CallbackQuery) -> None:
-    if not callback.from_user:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[2])
-    except ValueError:
-        await callback.answer("Невірний group_id", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    text = "Статистика буде додана окремим етапом. Дані вже зберігаються в БД."
-    keyboard = types.InlineKeyboardMarkup(
-        inline_keyboard=[[types.InlineKeyboardButton(text="Назад", callback_data=f"menu:group:{group_id}")]]
-    )
-    try:
-        await callback.message.edit_text(text=text, reply_markup=keyboard)
-    except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("menu:add_group_help:"))
-async def cb_menu_add_group_help(callback: types.CallbackQuery) -> None:
-    if not callback.from_user:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 4:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[3])
-    except ValueError:
-        await callback.answer("Невірний ідентифікатор групи", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    text = (
-        "Щоб додати нову групу:\n"
-        "1) Додайте бота в потрібну групу.\n"
-        "2) У групі виконайте /register_group (адміном групи).\n"
-        "3) Поверніться в /menu і оберіть групу."
-    )
-    keyboard = types.InlineKeyboardMarkup(
-        inline_keyboard=[[types.InlineKeyboardButton(text="Назад у головне меню", callback_data=f"menu:group:{group_id}")]]
-    )
-    try:
-        await callback.message.edit_text(text=text, reply_markup=keyboard)
-    except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("toggle:pending:"))
-async def cb_toggle_pending(callback: types.CallbackQuery, bot: Bot) -> None:
-    if not callback.from_user or not callback.message:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[2])
-    except ValueError:
-        await callback.answer("Невірний group_id", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    current = db.get_notify_pending(group_id)
-    new_value = not current
-    db.set_notify_pending(group_id, new_value)
-    if new_value:
-        await _refresh_alerts_for_group(bot, group_id, "pending")
-    else:
-        await _clear_alerts_for_group(bot, group_id, "pending")
-    await _set_dynamic_private_commands(callback.message.bot, callback.from_user.id)
-    await callback.answer(f"Сповіщення: {'УВІМКНЕНО' if new_value else 'ВИМКНЕНО'}")
-    await _show_settings_after_toggle(callback, group_id)
-
-
-@router.callback_query(F.data.startswith("toggle:blocked_sound:"))
-async def cb_toggle_blocked_sound(callback: types.CallbackQuery) -> None:
-    if not callback.from_user or not callback.message:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[2])
-    except ValueError:
-        await callback.answer("Невірний group_id", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    current = db.get_blocked_alert_sound(group_id)
-    db.set_blocked_alert_sound(group_id, not current)
-    await _set_dynamic_private_commands(callback.message.bot, callback.from_user.id)
-    await callback.answer(f"Звук авто-блокувань: {'УВІМКНЕНО' if not current else 'ВИМКНЕНО'}")
-    await _show_settings_after_toggle(callback, group_id)
-
-
-@router.callback_query(F.data.startswith("toggle:pause:"))
-async def cb_toggle_pause(callback: types.CallbackQuery) -> None:
-    if not callback.from_user or not callback.message:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[2])
-    except ValueError:
-        await callback.answer("Невірний group_id", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    db.set_group_paused(group_id, True)
-    await _set_dynamic_private_commands(callback.message.bot, callback.from_user.id)
-    await callback.answer("Модерацію призупинено")
-    await _show_settings_after_toggle(callback, group_id)
-
-
-@router.callback_query(F.data.startswith("toggle:resume:"))
-async def cb_toggle_resume(callback: types.CallbackQuery) -> None:
-    if not callback.from_user or not callback.message:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[2])
-    except ValueError:
-        await callback.answer("Невірний group_id", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    db.set_group_paused(group_id, False)
-    await _set_dynamic_private_commands(callback.message.bot, callback.from_user.id)
-    await callback.answer("Модерацію відновлено")
-    await _show_settings_after_toggle(callback, group_id)
-
-
-@router.callback_query(F.data.startswith("settings:add_group_help:"))
-async def cb_settings_add_group_help(callback: types.CallbackQuery) -> None:
-    if not callback.from_user:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 4:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[3])
-    except ValueError:
-        await callback.answer("Невірний ідентифікатор групи", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    text = (
-        "Щоб додати нову групу:\n"
-        "1) Додайте бота в потрібну групу.\n"
-        "2) У групі виконайте команду /register_group (адміном групи).\n"
-        "3) Поверніться в /menu і оберіть групу."
-    )
-    keyboard = types.InlineKeyboardMarkup(
-        inline_keyboard=[[types.InlineKeyboardButton(text="Назад у налаштування", callback_data=f"menu:settings:{group_id}")]]
-    )
-    try:
-        await callback.message.edit_text(text=text, reply_markup=keyboard)
-    except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("settings:add_moderator:"))
-async def cb_settings_add_moderator(callback: types.CallbackQuery) -> None:
-    if not callback.from_user:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    group_id = int(parts[2])
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    _PRIVATE_INPUT_FLOW[callback.from_user.id] = ("add_moderator", group_id)
-    text = (
-        "Надішліть user_id нового модератора одним повідомленням.\n"
-        "Перед цим новий модератор має натиснути /start у боті."
-    )
-    keyboard = types.InlineKeyboardMarkup(
-        inline_keyboard=[[types.InlineKeyboardButton(text="Скасувати", callback_data=f"menu:settings:{group_id}")]]
-    )
-    try:
-        await callback.message.edit_text(text=text, reply_markup=keyboard)
-    except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("settings:add_whitelist:"))
-async def cb_settings_add_whitelist(callback: types.CallbackQuery) -> None:
-    if not callback.from_user or not callback.message:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    group_id = int(parts[2])
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    key = _whitelist_state_key(callback.from_user.id, group_id)
-    _WHITELIST_SEARCH.pop(key, None)
-    _WHITELIST_OFFSET[key] = 0
-    await _render_whitelist_picker(callback, group_id, callback.from_user.id, offset=0)
-
-
-@router.callback_query(F.data.startswith("whitelist:page:"))
-async def cb_whitelist_page(callback: types.CallbackQuery) -> None:
-    if not callback.from_user:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 4:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[2])
-        offset = max(0, int(parts[3]))
-    except ValueError:
-        await callback.answer("Некоректні параметри", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    await _render_whitelist_picker(callback, group_id, callback.from_user.id, offset=offset)
-
-
-@router.callback_query(F.data.startswith("whitelist:search:"))
-async def cb_whitelist_search(callback: types.CallbackQuery) -> None:
-    if not callback.from_user or not callback.message:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[2])
-    except ValueError:
-        await callback.answer("Некоректна група", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    _PRIVATE_INPUT_FLOW[callback.from_user.id] = ("whitelist_search", group_id)
-    text = (
-        "Введіть текст пошуку (ім'я, @username, телефон або user_id).\n"
-        "Кожне нове повідомлення оновлює список.\n"
-        "Приклад: 410477852 або @nick."
-    )
-    keyboard = types.InlineKeyboardMarkup(
-        inline_keyboard=[[types.InlineKeyboardButton(text="Скасувати", callback_data=f"whitelist:page:{group_id}:0")]]
-    )
-    try:
-        await callback.message.edit_text(text=text, reply_markup=keyboard)
-    except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("whitelist:reset:"))
-async def cb_whitelist_reset(callback: types.CallbackQuery) -> None:
-    if not callback.from_user:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[2])
-    except ValueError:
-        await callback.answer("Некоректна група", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    key = _whitelist_state_key(callback.from_user.id, group_id)
-    _WHITELIST_SEARCH.pop(key, None)
-    _WHITELIST_OFFSET[key] = 0
-    await _render_whitelist_picker(callback, group_id, callback.from_user.id, offset=0)
-
-
-@router.callback_query(F.data.startswith("whitelist:ask:"))
-async def cb_whitelist_ask(callback: types.CallbackQuery) -> None:
-    if not callback.from_user or not callback.message:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 4:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[2])
-        target_user_id = int(parts[3])
-    except ValueError:
-        await callback.answer("Некоректні дані", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    _PRIVATE_INPUT_FLOW.pop(callback.from_user.id, None)
-    text = (
-        f"Надати постійну легалізацію користувачу {target_user_id}?\n"
-        "Після цього його адекватні реклами підуть у категорію 'Легалізовані'."
-    )
-    keyboard = types.InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                types.InlineKeyboardButton(text="Так", callback_data=f"whitelist:confirm:{group_id}:{target_user_id}"),
-                types.InlineKeyboardButton(text="Ні", callback_data=f"whitelist:page:{group_id}:0"),
-            ]
-        ]
-    )
-    try:
-        await callback.message.edit_text(text=text, reply_markup=keyboard)
-    except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("whitelist:confirm:"))
-async def cb_whitelist_confirm(callback: types.CallbackQuery) -> None:
-    if not callback.from_user:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 4:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[2])
-        target_user_id = int(parts[3])
-    except ValueError:
-        await callback.answer("Некоректні дані", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-    _PRIVATE_INPUT_FLOW.pop(callback.from_user.id, None)
-    db.add_whitelist(group_id, target_user_id, callback.from_user.id)
-    await callback.answer("Легалізацію надано")
-    await _render_whitelist_picker(callback, group_id, callback.from_user.id, offset=0)
-
-
-@router.callback_query(F.data.startswith("category:"))
-async def cb_open_category(callback: types.CallbackQuery) -> None:
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[1])
-    except ValueError:
-        await callback.answer("Невірний group_id", show_alert=True)
-        return
-    category = parts[2]
-    if category not in CATEGORY_ORDER:
-        await callback.answer("Невірна категорія", show_alert=True)
-        return
-    await _render_category(callback, group_id, category, idx=0)
 
 
 @router.callback_query(F.data.startswith("nav:"))
 async def cb_nav_category(callback: types.CallbackQuery) -> None:
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
     parts = callback.data.split(":")
     if len(parts) != 4:
         await callback.answer()
@@ -1871,255 +1340,30 @@ async def cb_nav_category(callback: types.CallbackQuery) -> None:
     if category not in CATEGORY_ORDER:
         await callback.answer("Невірна категорія", show_alert=True)
         return
-    await _render_category(callback, group_id, category, idx=idx)
-
-
-@router.callback_query(F.data.startswith("allask:"))
-async def cb_confirm_all_ask(callback: types.CallbackQuery) -> None:
-    if not callback.from_user:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[1])
-    except ValueError:
-        await callback.answer("Невірний group_id", show_alert=True)
-        return
-    category = parts[2]
-    if category not in {"blocked", "pending", "confirmed"}:
-        await callback.answer("Недоступно для цієї категорії", show_alert=True)
-        return
     if not db.is_moderator(group_id, callback.from_user.id):
         await callback.answer("Немає доступу", show_alert=True)
         return
 
-    text = f"Підтвердити всі реклами в категорії '{CATEGORY_LABELS[category]}'?\nЦе зніме індикатор очікування."
-    keyboard = types.InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                types.InlineKeyboardButton(text="Так", callback_data=f"allconfirm:{group_id}:{category}"),
-                types.InlineKeyboardButton(text="Ні", callback_data=f"category:{group_id}:{category}"),
-            ]
-        ]
-    )
+    unresolved_ads = _alert_ads_for_category(group_id, category)
+    if not unresolved_ads:
+        await callback.answer("Немає нових реклам у цій категорії")
+        return
+
+    idx = max(0, min(idx, len(unresolved_ads) - 1))
+    ad = unresolved_ads[idx]
+    text = _ad_card_text(category, ad, idx, len(unresolved_ads), len(unresolved_ads))
+    keyboard = _alert_nav_kb(group_id, category, ad, idx, len(unresolved_ads))
     try:
-        await callback.message.edit_text(text=text, reply_markup=keyboard)
+        await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=keyboard)
     except TelegramAPIError:
-        await callback.message.answer(text=text, reply_markup=keyboard)
+        await callback.answer("Не вдалося оновити повідомлення", show_alert=True)
+        return
     await callback.answer()
-
-
-@router.callback_query(F.data.startswith("allconfirm:"))
-async def cb_confirm_all(callback: types.CallbackQuery, bot: Bot) -> None:
-    if not callback.from_user:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[1])
-    except ValueError:
-        await callback.answer("Невірний group_id", show_alert=True)
-        return
-    category = parts[2]
-    if category not in {"blocked", "pending", "confirmed"}:
-        await callback.answer("Недоступно для цієї категорії", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-
-    if category == "blocked":
-        updated = db.confirm_all(
-            group_id,
-            category,
-            callback.from_user.id,
-            decision="acknowledged",
-            action="acknowledged_all",
-        )
-    else:
-        updated = db.confirm_all(group_id, category, callback.from_user.id)
-    await _refresh_alerts_for_group(bot, group_id, category)
-    await callback.answer(f"Підтверджено: {updated}")
-    await _render_category(callback, group_id, category, idx=0)
-
-
-@router.callback_query(F.data.startswith("ackalert:"))
-async def cb_ack_alert(callback: types.CallbackQuery) -> None:
-    if not callback.from_user:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[1])
-    except ValueError:
-        await callback.answer("Невірний group_id", show_alert=True)
-        return
-    category = parts[2]
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-
-    db.clear_alert_state(callback.from_user.id, group_id, category)
-    try:
-        await callback.message.delete()
-    except TelegramAPIError:
-        pass
-    await callback.answer("Прибрано")
-
-
-@router.callback_query(F.data.startswith("action:"))
-async def cb_action(callback: types.CallbackQuery, bot: Bot) -> None:
-    if not callback.from_user:
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 6:
-        await callback.answer()
-        return
-    try:
-        group_id = int(parts[1])
-        ad_id = int(parts[3])
-        idx = int(parts[5])
-    except ValueError:
-        await callback.answer("Некоректні параметри", show_alert=True)
-        return
-
-    category = parts[2]
-    action = parts[4]
-    if category not in CATEGORY_ORDER:
-        await callback.answer("Невірна категорія", show_alert=True)
-        return
-    if not db.is_moderator(group_id, callback.from_user.id):
-        await callback.answer("Немає доступу", show_alert=True)
-        return
-
-    ad = db.get_ad(ad_id)
-    if ad is None:
-        await callback.answer("Запис не знайдено", show_alert=True)
-        return
-    if int(ad["group_id"]) != group_id:
-        await callback.answer("Невірна група", show_alert=True)
-        return
-
-    if action == "approve":
-        db.update_ad_decision(ad_id=ad_id, decision="approved", moderator_id=callback.from_user.id, requires_action=False)
-        await callback.answer("Підтверджено")
-    elif action == "ack":
-        db.update_ad_decision(ad_id=ad_id, decision="acknowledged", moderator_id=callback.from_user.id, requires_action=False)
-        await callback.answer("Позначено")
-    elif action == "block":
-        if not config.TEST_MODE:
-            await delete_message_safe(bot, int(ad["source_chat_id"]), int(ad["source_message_id"]))
-            await apply_permanent_mute(bot, int(ad["source_chat_id"]), int(ad["user_id"]))
-        state.add_strike(group_id, int(ad["user_id"]))
-        db.update_ad_decision(
-            ad_id=ad_id,
-            decision="muted_manual",
-            moderator_id=callback.from_user.id,
-            requires_action=False,
-            category="blocked",
-            note="manual block",
-        )
-        await callback.answer("Заблоковано")
-    elif action == "unmute":
-        if not config.TEST_MODE:
-            await apply_unmute(bot, int(ad["source_chat_id"]), int(ad["user_id"]))
-        db.update_ad_decision(
-            ad_id=ad_id,
-            decision="unmuted",
-            moderator_id=callback.from_user.id,
-            requires_action=False,
-            category="blocked",
-            note="manual unmute",
-        )
-        await callback.answer("Розблоковано")
-    else:
-        await callback.answer("Невідома дія", show_alert=True)
-        return
-
-    await _refresh_alerts_for_group(bot, group_id, "blocked")
-    await _refresh_alerts_for_group(bot, group_id, "suspect")
-    await _refresh_alerts_for_group(bot, group_id, "pending")
-    await _refresh_alerts_for_group(bot, group_id, "confirmed")
-
-    target_category = "blocked" if action == "block" else category
-    await _render_category(callback, group_id, target_category, idx=idx)
 
 
 @router.callback_query(F.data == "noop")
 async def cb_noop(callback: types.CallbackQuery) -> None:
     await callback.answer()
-
-
-@router.message(F.chat.type == "private")
-async def private_input_flow_handler(message: types.Message) -> None:
-    if not message.from_user:
-        return
-    text = (message.text or "").strip()
-    if not text or text.startswith("/"):
-        return
-
-    flow = _PRIVATE_INPUT_FLOW.get(message.from_user.id)
-    if flow is None:
-        return
-
-    action, group_id = flow
-    if not db.is_moderator(group_id, message.from_user.id):
-        _PRIVATE_INPUT_FLOW.pop(message.from_user.id, None)
-        await _send_context_message(message, "Немає доступу до цієї групи.")
-        return
-
-    if action == "whitelist_search":
-        key = _whitelist_state_key(message.from_user.id, group_id)
-        _WHITELIST_SEARCH[key] = text
-        _WHITELIST_OFFSET[key] = 0
-
-        rows, total = db.list_group_users_for_whitelist(group_id, text, limit=8, offset=0)
-        query_line = f"Пошук: {text}" if text else "Пошук: (не задано)"
-        keyboard = _whitelist_picker_kb(group_id, rows, 0, total)
-        await _send_context_message(
-            message,
-            "Оберіть користувача для постійної легалізації.\n"
-            f"{query_line}\n"
-            f"Знайдено: {total}\n"
-            "Надішліть новий запит, щоб одразу оновити результати.",
-            reply_markup=keyboard,
-        )
-        return
-
-    try:
-        target_user_id = int(text)
-    except ValueError:
-        await _send_context_message(message, "Невірний user_id. Надішліть тільки число.")
-        return
-
-    if action == "add_moderator":
-        db.add_moderator(group_id, target_user_id, message.from_user.id)
-        _PRIVATE_INPUT_FLOW.pop(message.from_user.id, None)
-        await _send_context_message(
-            message,
-            f"✅ Модератора {target_user_id} додано до групи {group_id}.",
-            reply_markup=types.InlineKeyboardMarkup(
-                inline_keyboard=[[types.InlineKeyboardButton(text="До налаштувань групи", callback_data=f"menu:settings:{group_id}")]]
-            ),
-        )
-        return
-
-    if action == "add_whitelist":
-        db.add_whitelist(group_id, target_user_id, message.from_user.id)
-        _PRIVATE_INPUT_FLOW.pop(message.from_user.id, None)
-        await _send_context_message(
-            message,
-            f"✅ Користувачу {target_user_id} надано постійну легалізацію у групі {group_id}.",
-            reply_markup=types.InlineKeyboardMarkup(
-                inline_keyboard=[[types.InlineKeyboardButton(text="До налаштувань групи", callback_data=f"menu:settings:{group_id}")]]
-            ),
-        )
 
 
 @router.message(F.chat.type.in_({"group", "supergroup"}))

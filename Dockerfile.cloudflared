@@ -1,0 +1,22 @@
+FROM debian:bookworm-slim
+
+ARG CLOUDFLARED_VERSION=latest
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN if [ "$CLOUDFLARED_VERSION" = "latest" ]; then \
+        DOWNLOAD_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"; \
+    else \
+        DOWNLOAD_URL="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"; \
+    fi \
+    && curl -fsSL "$DOWNLOAD_URL" -o /usr/local/bin/cloudflared \
+    && chmod +x /usr/local/bin/cloudflared
+
+WORKDIR /app
+
+COPY docker/cloudflared-entrypoint.sh /usr/local/bin/cloudflared-entrypoint.sh
+RUN chmod +x /usr/local/bin/cloudflared-entrypoint.sh
+
+CMD ["/usr/local/bin/cloudflared-entrypoint.sh"]

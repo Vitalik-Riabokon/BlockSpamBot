@@ -1,3 +1,5 @@
+"""Message classification helpers for ads, scam patterns and hard-block content."""
+
 import re
 
 from aiogram import types
@@ -19,6 +21,7 @@ from .rules import (
 
 
 def normalize_obfuscated_domain(candidate: str) -> str:
+    """Normalize intentionally obfuscated domain-like fragments into a comparable form."""
     value = candidate.lower()
     value = re.sub(r"\b(dot|точка|точкa|\[dot\]|\(dot\)|\{dot\})\b", ".", value)
     value = re.sub(r"[\s\[\]\(\)\{\}\|,;:+]+", ".", value)
@@ -28,6 +31,7 @@ def normalize_obfuscated_domain(candidate: str) -> str:
 
 
 def contains_suspicious_domain(text: str) -> bool:
+    """Return True when text contains a direct or obfuscated suspicious domain signal."""
     if url_regex.search(text):
         return True
 
@@ -46,6 +50,7 @@ def contains_suspicious_domain(text: str) -> bool:
 
 
 def normalize_text_for_match(text: str) -> str:
+    """Normalize text for keyword matching across minor locale and whitespace variations."""
     cleaned = text.lower()
     cleaned = cleaned.replace("ё", "е").replace("і", "i")
     cleaned = re.sub(r"[\u200b-\u200f\u2060]", "", cleaned)
@@ -54,11 +59,13 @@ def normalize_text_for_match(text: str) -> str:
 
 
 def get_text(message: types.Message) -> str:
+    """Extract plain moderation text from message body and caption."""
     text = (message.text or "") + " " + (getattr(message, "caption", "") or "")
     return text.strip()
 
 
 def has_any_keyword(text_lower: str, keywords: list[str] | set[str]) -> bool:
+    """Check whether normalized text contains any normalized keyword."""
     normalized_text = normalize_text_for_match(text_lower)
     for keyword in keywords:
         normalized_keyword = normalize_text_for_match(str(keyword))
@@ -68,10 +75,12 @@ def has_any_keyword(text_lower: str, keywords: list[str] | set[str]) -> bool:
 
 
 def is_authorized_ad(author: types.User, policy: GroupPolicy) -> bool:
+    """Return whether the author is currently legalised for this group."""
     return author.id in policy.authorized_user_ids
 
 
 def has_contact_signal(message: types.Message, text: str) -> bool:
+    """Detect contact or delivery signals that make an ad actionable."""
     if url_regex.search(text) or simple_domain_regex.search(text):
         return True
     if contains_suspicious_domain(text):
@@ -88,6 +97,7 @@ def has_contact_signal(message: types.Message, text: str) -> bool:
 
 
 def ad_intent(message: types.Message, text: str) -> tuple[bool, list[str]]:
+    """Estimate whether the message has enough offer/contact/CTA signals to be treated as an ad."""
     text_lower = normalize_text_for_match(text)
     reasons = []
     signals = 0
@@ -106,12 +116,14 @@ def ad_intent(message: types.Message, text: str) -> tuple[bool, list[str]]:
 
 
 def hard_illegal_detected(text_lower: str, policy: GroupPolicy) -> bool:
+    """Detect hard-block illegal content from built-in or group-specific triggers."""
     return has_any_keyword(text_lower, HARD_ILLEGAL_KEYWORDS) or has_any_keyword(
         text_lower, policy.hard_block_extra_keywords
     )
 
 
 def classify_message(message: types.Message, policy: GroupPolicy) -> ModerationResult:
+    """Classify a Telegram message into safe, pending, suspect or blocked ad status."""
     text = get_text(message)
     if not text:
         return ModerationResult(ModerationStatus.SAFE_TEXT, 0, ["no_text"], False)

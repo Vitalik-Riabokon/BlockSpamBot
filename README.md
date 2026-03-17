@@ -1,123 +1,113 @@
 # BayreuthUkraine Anti-Spam Bot
 
-Telegram moderation bot with multi-group and multi-moderator isolation.
+Telegram moderation bot with WebApp-first moderation flow.
 
-## Core model
+## What it does
 
-- Group can be auto-registered when bot is added to a group (bound to the user who added it).
-- Manual registration via `/register_group` is still available.
-- Every registered group has its own:
+- Auto-registers a group when a moderator adds the bot.
+- Isolates data per group:
   - moderators
-  - whitelist
-  - hard-block custom keywords
-  - review-alert toggle
-- Alerts are sent only to moderators of the same group, in private chat with bot.
-- Moderators of group A do not receive data from group B.
+  - legalised advertisers
+  - custom triggers
+  - notification settings
+- Sends private alerts only to moderators of the same group.
+- Uses Telegram for alerts and WebApp for moderation actions.
 
-## Project structure
+## Main components
 
 - `main/main.py` - app entrypoint
-- `main/bot/config.py` - env/configuration
-- `main/bot/db.py` - sqlite storage and isolation logic
-- `main/bot/rules.py` - keywords and regex patterns
-- `main/bot/state.py` - in-memory spam/reputation state (per group)
-- `main/bot/models.py` - moderation models/statuses
-- `main/bot/classifier.py` - classification logic
-- `main/bot/actions.py` - delete/ban/notify actions
-- `main/bot/handlers.py` - aiogram handlers/router
-- `main/bot/webapp_server.py` - WebApp backend (live search + whitelist actions)
-- `main/webapp/` - WebApp frontend files
+- `main/bot/config.py` - environment/config
+- `main/bot/db.py` - sqlite storage
+- `main/bot/classifier.py` - ad/risk classification
+- `main/bot/handlers.py` - Telegram bot handlers
+- `main/bot/webapp_server.py` - WebApp backend API
+- `main/bot/tunnel_notifier.py` - current public tunnel URL tracking
+- `main/webapp/` - WebApp frontend
 
-## Run
+## Local run
 
-1. Create `.env` from `.env.example` and set `BOT_TOKEN`.
-2. Install dependencies:
+1. Create `.env` from `.env.example`
+2. Set at least `BOT_TOKEN`
+3. Install dependencies:
    - `pip install -r requirements.txt`
-3. Start bot:
+4. Start:
    - `python main/main.py`
 
-## Key env vars
+If you run the bot locally with polling, make sure there is no second instance with the same token.
+
+## Docker / Docker Compose
+
+Production layout:
+
+- `bot` - Telegram bot + WebApp backend
+- `cloudflared` - tunnel sidecar
+
+### Start
+
+1. Fill `.env`
+2. Run:
+   - `docker compose up -d --build`
+
+### Stop
+
+- `docker compose down`
+
+### What compose does
+
+- starts bot on `0.0.0.0:8080`
+- starts `cloudflared` as a separate service
+- writes tunnel log to `main/data/cloudflared.out.log`
+- keeps sqlite data in a Docker volume
+- bot reads the shared tunnel log and sends the current public URL to the owner in Telegram
+
+### Check status
+
+- `docker compose ps`
+- `docker compose logs bot --tail=100`
+- `docker compose logs cloudflared --tail=100`
+
+### Deploy flow after tunnel URL changes
+
+1. Bot sends you the new `trycloudflare` URL in private.
+2. In `@BotFather` run `/setdomain`.
+3. Paste only the domain part, without `https://`.
+4. Reopen the WebApp.
+
+### Token rotation
+
+If you suspect another instance is still using the bot token:
+
+1. Generate a new token in `@BotFather`
+2. Update `BOT_TOKEN` in `.env`
+3. Restart the stack:
+   - `docker compose down`
+   - `docker compose up -d --build`
+
+## Important env vars
 
 - `BOT_TOKEN` - Telegram bot token
-- `TEST_MODE` - `1/0`; when `1` bot does not delete/ban
-- `SUSPECT_SCORE_THRESHOLD` - suspect threshold
-- `BLOCK_SCORE_THRESHOLD` - block threshold
-- `SUSPECT_ESCALATION_COUNT` - suspect repeats before auto-block
-- `WINDOW_SECONDS`, `FLOOD_COUNT`, `DUPLICATE_WINDOW_SECONDS` - spam pattern tuning
-- `WEBAPP_BASE_URL` - public HTTPS base URL for Telegram WebApp button
-- `WEBAPP_HOST`, `WEBAPP_PORT` - local WebApp server bind settings
+- `TEST_MODE` - when `1`, bot analyzes but does not perform destructive moderation actions
+- `WEBAPP_HOST`, `WEBAPP_PORT` - local bind for WebApp backend
+- `WEBAPP_BASE_URL` - optional fallback public URL; normal tunnel flow uses runtime tunnel state
+- `TUNNEL_NOTIFY_ENABLED` - send tunnel URL updates in Telegram
+- `TUNNEL_NOTIFY_USER_ID` - who receives tunnel URL updates
+- `CLOUDFLARED_AUTO_START` - local mode only; in Docker it must stay `0`
+- `CLOUDFLARED_BIN` - local cloudflared binary path/name
+- `CLOUDFLARED_TARGET_URL` - target URL for cloudflared in local mode
+- `TUNNEL_LOG_PATH` - shared tunnel log path
+- `BOT_LOCK_PATH` - process lock file path
+- `SPLIT_WINDOW_SECONDS`, `SPLIT_MAX_MESSAGES` - split-message ad detection window
+- `AD_DUPLICATE_BLOCK_WINDOW_SECONDS`, `AD_DUPLICATE_BLOCK_COUNT` - duplicate-ad hard block heuristics
 
-## Commands
+## Runtime behavior
 
-### Basic
-
-- `/start`
-- `/menu`
-- `/my_id`
-- `/chat_id`
-- `/mod_help`
-- `/my_groups`
-
-### Group registration
-
-- `/register_group` (run in target group; only group admin)
-- `/delete_group [group_id]` (only group creator who registered it)
-
-### Moderators
-
-- `/add_moderator <user_id> [group_id|all]`
-- `/remove_moderator <user_id> [group_id|all]`
-- `/list_moderators [group_id]`
-
-### Lists
-
-- `/add_whitelist <user_id> [group_id|all]`
-- `/remove_whitelist <user_id> [group_id|all]`
-- `/list_whitelist [group_id]`
-
-### Hard-block custom words
-
-- `/add_hardword <word or phrase> [group_id|all]`
-- `/remove_hardword <word or phrase> [group_id|all]`
-- `/list_hardwords [group_id]`
-
-If phrase has spaces and you need explicit groups, use delimiter:
-- `/add_hardword some phrase | all`
-
-### Alerts
-
-- `/set_pending_alerts <on|off> [group_id|all]`
-- `/set_blocked_sound <on|off> [group_id|all]`
-- `/set_review_alerts <on|off> [group_id|all]` (alias to pending alerts)
-- `/pause_group [group_id|all]`
-- `/resume_group [group_id|all]`
-
-## WebApp легалізації
-
-- У розділі `Налаштування` є кнопка `WebApp: Легалізація` (якщо задано `WEBAPP_BASE_URL`).
-- WebApp дає live-пошук по користувачах групи (ID, ім'я, username, телефон).
-- Можна надати або зняти легалізацію без зайвих повідомлень у приватному чаті.
-- Для роботи кнопки потрібен публічний HTTPS домен (локальний `http://127.0.0.1` Telegram не відкриє в клієнті).
-
-## Important behavior
-
-- `whitelist` = trusted advertiser in that group:
-  - no push notifications for their ads
-  - hard-block (critical) ads are still auto-deleted/muted and moderators are notified
-
-- Ads are separated into menu categories:
-  - `blocked` - auto-blocked ads (with unmute/ack workflow)
-  - `suspect` - requires manual approve/block
-  - `pending` - non-critical, not confirmed ads
-  - `confirmed` - ads from whitelist users (no push, still reviewable)
-
-### Add moderator flow
-
-1. New moderator opens bot in private and sends `/start`.
-2. New moderator sends you their id from `/my_id`.
-3. Current moderator adds them via `/add_moderator <user_id> [group_id|all]`.
+- `Проблемна` alerts are always important.
+- `Не санкціонована` alerts depend on group setting.
+- `Легалізовані` do not send push alerts.
+- `Заблоковані` alerts use their own sound setting.
+- Daily cleanup removes recent service messages and posts one fresh status message.
 
 ## Security
 
-- Never commit `.env` or real bot tokens.
-- If token was posted publicly, revoke it in `@BotFather` and generate a new one.
+- Do not commit `.env`.
+- If a token was exposed, revoke it in `@BotFather`.

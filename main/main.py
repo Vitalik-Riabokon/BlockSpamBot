@@ -1,3 +1,5 @@
+"""Application entrypoint for the Telegram bot and WebApp backend."""
+
 import asyncio
 import contextlib
 import logging
@@ -6,15 +8,17 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, types
 
-from bot.config import BOT_TOKEN, TEST_MODE, WEBAPP_HOST, WEBAPP_PORT
+from bot.config import BOT_LOCK_PATH, BOT_TOKEN, TEST_MODE, WEBAPP_HOST, WEBAPP_PORT
 from bot.db import init_db
 from bot.handlers import periodic_private_context_cleanup, router
+from bot.tunnel_notifier import get_public_webapp_base_url, run_cloudflared_tunnel
 from bot.webapp_server import start_webapp_server
 
-LOCK_PATH = Path("main/data/bot.lock")
+LOCK_PATH = Path(BOT_LOCK_PATH)
 
 
 def _pid_running(pid: int) -> bool:
+    """Return whether a process with the given PID is currently alive."""
     try:
         os.kill(pid, 0)
         return True
@@ -23,6 +27,7 @@ def _pid_running(pid: int) -> bool:
 
 
 def acquire_lock() -> int:
+    """Create an exclusive process lock and recover stale lock files when possible."""
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     # Recover from stale lock file left by crashed process.
@@ -47,6 +52,7 @@ def acquire_lock() -> int:
 
 
 def release_lock(fd: int) -> None:
+    """Release the process lock and remove the lock file."""
     try:
         os.close(fd)
     finally:
@@ -57,34 +63,40 @@ def release_lock(fd: int) -> None:
 
 
 async def main() -> None:
+    """Start database, WebApp server, Telegram polling and background tasks."""
     logging.basicConfig(level=logging.INFO)
     init_db()
     bot = Bot(token=BOT_TOKEN)
-    web_runner, _web_site = await start_webapp_server(WEBAPP_HOST, WEBAPP_PORT)
+    web_runner, _web_site = await start_webapp_server(bot, WEBAPP_HOST, WEBAPP_PORT)
     logging.info("WebApp server started on http://%s:%s/webapp", WEBAPP_HOST, WEBAPP_PORT)
+    base = get_public_webapp_base_url()
+    if base:
+        await bot.set_chat_menu_button(
+            menu_button=types.MenuButtonWebApp(
+                text="Застосунок",
+                web_app=types.WebAppInfo(url=f"{base.rstrip('/')}/webapp"),
+            )
+        )
     await bot.set_my_commands(
         [
             types.BotCommand(command="start", description="Початок роботи з ботом"),
-            types.BotCommand(command="menu", description="Головне меню модератора"),
-            types.BotCommand(command="my_groups", description="Мої підключені групи"),
-            types.BotCommand(command="my_id", description="Показати мій user id"),
-            types.BotCommand(command="mod_help", description="Довідка по командах"),
-            types.BotCommand(command="toggle_pending", description="Увімк/вимк сповіщення від не санкціонованих реклам"),
-            types.BotCommand(command="toggle_blocked_sound", description="Увімк/вимк звук від заблокованих реклам"),
-            types.BotCommand(command="pause_group", description="Увімк/вимк модерацію обраної групи"),
         ]
     )
     dp = Dispatcher()
     dp.include_router(router)
     cleanup_task = asyncio.create_task(periodic_private_context_cleanup(bot))
+    cloudflared_task = asyncio.create_task(run_cloudflared_tunnel(bot))
 
     logging.info("Bot started. TEST_MODE = %s", TEST_MODE)
     try:
         await dp.start_polling(bot)
     finally:
         cleanup_task.cancel()
+        cloudflared_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await cleanup_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await cloudflared_task
         with contextlib.suppress(Exception):
             await web_runner.cleanup()
 

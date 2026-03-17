@@ -23,6 +23,8 @@ env/
 # Logs and runtime files
 *.log
 logs/
+main/data/*
+!main/data/.gitkeep
 main/data/*.db
 main/data/*.db-*
 main/data/bot.lock

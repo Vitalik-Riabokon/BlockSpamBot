@@ -1,0 +1,48 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Europe/Berlin
+      WEBAPP_HOST: 0.0.0.0
+      WEBAPP_PORT: 8080
+      CLOUDFLARED_AUTO_START: 0
+      BOT_LOCK_PATH: /tmp/bot.lock
+      TUNNEL_LOG_PATH: /app/main/data/cloudflared.out.log
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    volumes:
+      - bot_data:/app/main/data
+
+  cloudflared:
+    build:
+      context: .
+      dockerfile: Dockerfile.cloudflared
+    init: true
+    restart: unless-stopped
+    depends_on:
+      bot:
+        condition: service_healthy
+    environment:
+      CLOUDFLARED_TARGET_URL: http://bot:8080
+      TUNNEL_LOG_PATH: /shared/cloudflared.out.log
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /shared/cloudflared.out.log && grep -q 'trycloudflare.com' /shared/cloudflared.out.log"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    volumes:
+      - bot_data:/shared
+
+volumes:
+  bot_data:
