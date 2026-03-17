@@ -274,6 +274,7 @@ def _short_text(text: str, limit: int = 1400) -> str:
 
 
 def _build_webapp_url(group_id: int | None = None, section: str = "ads", category: str | None = None, ad_id: int | None = None) -> str:
+    """Build a WebApp deep link pointing to a specific group, section or ad."""
     base = get_public_webapp_base_url()
     if not base:
         return ""
@@ -288,6 +289,7 @@ def _build_webapp_url(group_id: int | None = None, section: str = "ads", categor
 
 
 def _main_menu_text(group_id: int) -> str:
+    """Build the compact private-chat summary for the selected group."""
     group = db.get_group(group_id)
     title = str(group["title"]) if group else str(group_id)
     counts = db.get_unresolved_counts(group_id)
@@ -304,6 +306,7 @@ def _main_menu_text(group_id: int) -> str:
 
 
 def _main_menu_kb(group_id: int) -> types.InlineKeyboardMarkup:
+    """Build the private-chat keyboard with a single WebApp entry button."""
     webapp_url = _build_webapp_url(group_id=group_id, section="ads")
     keyboard: list[list[types.InlineKeyboardButton]] = []
     if webapp_url:
@@ -311,7 +314,8 @@ def _main_menu_kb(group_id: int) -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def _ad_card_text(category: str, ad, idx: int, total: int, unresolved_count: int) -> str:
+def _ad_card_text(category: str, ad: object, idx: int, total: int, unresolved_count: int) -> str:
+    """Build a Telegram alert card for one unresolved moderation item."""
     label = CATEGORY_LABELS.get(category, category)
     user_id = int(ad["user_id"])
     username = _safe_username(ad["at_username"] or ad["username"])
@@ -337,7 +341,8 @@ def _ad_card_text(category: str, ad, idx: int, total: int, unresolved_count: int
     )
 
 
-def _alert_nav_kb(group_id: int, category: str, ad, idx: int, total: int) -> types.InlineKeyboardMarkup:
+def _alert_nav_kb(group_id: int, category: str, ad: object, idx: int, total: int) -> types.InlineKeyboardMarkup:
+    """Build alert navigation keyboard with WebApp open button and pager."""
     ad_id = int(ad["ad_id"])
     webapp_url = _build_webapp_url(group_id=group_id, section="ads", category=category, ad_id=ad_id)
     keyboard: list[list[types.InlineKeyboardButton]] = []
@@ -364,7 +369,8 @@ def _alert_nav_kb(group_id: int, category: str, ad, idx: int, total: int) -> typ
     return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def _alert_ads_for_category(group_id: int, category: str) -> list:
+def _alert_ads_for_category(group_id: int, category: str) -> list[object]:
+    """Return unresolved ads that should currently generate Telegram alerts."""
     if category == "confirmed":
         return []
     return db.list_ads(group_id, category, unresolved_only=True)
@@ -379,6 +385,7 @@ async def _send_or_edit_private(
     keyboard: types.InlineKeyboardMarkup,
     disable_notification: bool,
 ) -> None:
+    """Edit an existing moderator alert or create a new one if missing."""
     state_row = db.get_alert_state(moderator_id, group_id, category)
     if state_row is not None:
         try:
@@ -417,6 +424,7 @@ async def _send_or_edit_private(
 
 
 async def _refresh_alert_for_moderator(bot: Bot, moderator_id: int, group_id: int, category: str) -> None:
+    """Synchronize one moderator's alert message for a single category."""
     if category == "confirmed":
         row = db.get_alert_state(moderator_id, group_id, category)
         if row is not None:
@@ -463,11 +471,13 @@ async def _refresh_alert_for_moderator(bot: Bot, moderator_id: int, group_id: in
 
 
 async def _refresh_alerts_for_group(bot: Bot, group_id: int, category: str) -> None:
+    """Refresh one moderation category for every moderator of the group."""
     for moderator_id in db.list_moderators(group_id):
         await _refresh_alert_for_moderator(bot, moderator_id, group_id, category)
 
 
 async def _clear_alerts_for_group(bot: Bot, group_id: int, category: str) -> None:
+    """Delete Telegram alert messages for a category across all moderators."""
     for moderator_id in db.list_moderators(group_id):
         row = db.get_alert_state(moderator_id, group_id, category)
         if row is None:
@@ -481,6 +491,7 @@ async def _clear_alerts_for_group(bot: Bot, group_id: int, category: str) -> Non
 
 
 def _daily_summary_disable_notification(group_id: int) -> bool:
+    """Decide whether the daily private summary should be silent."""
     counts = db.get_unresolved_counts(group_id)
     if counts.get("suspect", 0) > 0:
         return False
@@ -492,6 +503,7 @@ def _daily_summary_disable_notification(group_id: int) -> bool:
 
 
 def _pick_summary_group_for_user(user_id: int) -> int | None:
+    """Pick the most relevant group for daily private summary delivery."""
     selected_group_id = db.get_selected_group(user_id)
     if selected_group_id is not None and db.is_moderator(int(selected_group_id), user_id):
         return int(selected_group_id)
@@ -608,6 +620,7 @@ async def periodic_private_context_cleanup(
 
 
 async def _show_groups_menu(message: types.Message, intro: bool = False) -> None:
+    """Show the current private main menu or onboarding message."""
     if not message.from_user:
         return
     if message.chat.type == "private":
@@ -634,6 +647,7 @@ async def _show_groups_menu(message: types.Message, intro: bool = False) -> None
 
 
 async def _refresh_private_context_for_user(bot: Bot, user_id: int) -> bool:
+    """Rebuild the last private menu message for one user."""
     row = db.get_private_context_state(user_id)
     if row is None:
         return False
@@ -708,6 +722,7 @@ async def _refresh_private_context_for_user(bot: Bot, user_id: int) -> bool:
 
 
 async def _can_enforce_group_actions(bot: Bot, chat_id: int) -> bool:
+    """Check whether the bot currently has rights to delete and restrict in a chat."""
     if config.TEST_MODE:
         return False
     try:
@@ -727,11 +742,7 @@ async def _can_enforce_group_actions(bot: Bot, chat_id: int) -> bool:
 
 
 def _should_block_split_chain(policy: GroupPolicy, recent_items: list[tuple[int, str]]) -> tuple[bool, str]:
-    """
-    Split-message protection:
-    if last N messages (within window) together look like aggressive scam ad,
-    block immediately.
-    """
+    """Decide whether a short split-message chain should be escalated to immediate block."""
     if len(recent_items) < config.SPLIT_MAX_MESSAGES:
         return False, ""
 
@@ -753,17 +764,20 @@ def _should_block_split_chain(policy: GroupPolicy, recent_items: list[tuple[int,
 
 @router.message(CommandStart())
 async def start_handler(message: types.Message) -> None:
+    """Handle `/start` in private chat and show current group summary."""
     await _show_groups_menu(message, intro=True)
 
 
 @router.message(Command("menu"))
 async def menu_handler(message: types.Message) -> None:
+    """Handle `/menu` and reopen the current private main menu."""
     await _show_groups_menu(message, intro=False)
 
 
 @router.message(Command("help"))
 @router.message(Command("mod_help"))
 async def help_handler(message: types.Message) -> None:
+    """Send a concise help text for remaining slash-command fallbacks."""
     await _send_context_message(message, 
         "\n".join(
             [
@@ -802,17 +816,20 @@ async def help_handler(message: types.Message) -> None:
 
 @router.message(Command("my_id"))
 async def my_id(message: types.Message) -> None:
+    """Send the current Telegram user id in private chat."""
     if message.from_user:
         await _send_context_message(message, f"Ваш ідентифікатор користувача: {message.from_user.id}")
 
 
 @router.message(Command("chat_id"))
 async def chat_id(message: types.Message) -> None:
+    """Send current chat id for debugging and setup."""
     await _send_context_message(message, f"Поточний ідентифікатор чату: {message.chat.id}")
 
 
 @router.message(Command("register_group"))
 async def register_group(message: types.Message, bot: Bot) -> None:
+    """Fallback manual group registration when Telegram auto-registration is insufficient."""
     if message.chat.type not in ("group", "supergroup"):
         await _send_context_message(message, "Команда працює тільки в групі.")
         return
@@ -846,6 +863,7 @@ async def register_group(message: types.Message, bot: Bot) -> None:
 
 @router.message(Command("delete_group"))
 async def delete_group(message: types.Message, bot: Bot) -> None:
+    """Delete a registered group and make the bot leave it."""
     if not message.from_user:
         return
 
@@ -872,6 +890,7 @@ async def delete_group(message: types.Message, bot: Bot) -> None:
 
 @router.my_chat_member()
 async def bot_membership_changed(event: types.ChatMemberUpdated) -> None:
+    """Auto-register groups on bot add and remove them on bot removal."""
     if event.chat.type not in ("group", "supergroup"):
         return
 
@@ -892,6 +911,7 @@ async def bot_membership_changed(event: types.ChatMemberUpdated) -> None:
 
 @router.message(Command("my_groups"))
 async def my_groups(message: types.Message) -> None:
+    """List groups currently available to the moderator."""
     if not message.from_user:
         return
     rows = db.list_user_groups(message.from_user.id)
@@ -913,6 +933,7 @@ async def my_groups(message: types.Message) -> None:
 
 @router.message(Command("pause_group"))
 async def pause_group(message: types.Message) -> None:
+    """Toggle moderation pause state for one or more groups."""
     if not message.from_user:
         return
     command_group_spec = _command_arg(message)
@@ -939,6 +960,7 @@ async def pause_group(message: types.Message) -> None:
 
 @router.message(Command("resume_group"))
 async def resume_group(message: types.Message) -> None:
+    """Explicitly resume moderation for one or more groups."""
     if not message.from_user:
         return
     target_groups, err = _resolve_target_groups(message, message.from_user.id, _command_arg(message))
@@ -953,6 +975,7 @@ async def resume_group(message: types.Message) -> None:
 
 @router.message(Command("set_pending_alerts"))
 async def set_pending_alerts(message: types.Message) -> None:
+    """Set pending-ad alert state for selected groups."""
     if not message.from_user:
         return
     raw = _command_arg(message)
@@ -977,6 +1000,7 @@ async def set_pending_alerts(message: types.Message) -> None:
 
 @router.message(Command("set_blocked_sound"))
 async def set_blocked_sound(message: types.Message) -> None:
+    """Set blocked-alert sound state for selected groups."""
     if not message.from_user:
         return
     raw = _command_arg(message)
@@ -1001,11 +1025,13 @@ async def set_blocked_sound(message: types.Message) -> None:
 
 @router.message(Command("set_review_alerts"))
 async def set_review_alerts_alias(message: types.Message) -> None:
+    """Backward-compatible alias for pending alerts command."""
     await set_pending_alerts(message)
 
 
 @router.message(Command("toggle_pending"))
 async def toggle_pending_command(message: types.Message) -> None:
+    """Toggle pending alerts for the currently selected private group."""
     if not message.from_user:
         return
     group_id, err = _resolve_selected_group_for_quick_action(message.from_user.id, message.chat.id)
@@ -1025,6 +1051,7 @@ async def toggle_pending_command(message: types.Message) -> None:
 
 @router.message(Command("toggle_blocked_sound"))
 async def toggle_blocked_sound_command(message: types.Message) -> None:
+    """Toggle blocked alert sound for the currently selected private group."""
     if not message.from_user:
         return
     group_id, err = _resolve_selected_group_for_quick_action(message.from_user.id, message.chat.id)
@@ -1044,6 +1071,7 @@ async def toggle_blocked_sound_command(message: types.Message) -> None:
 
 @router.message(Command("add_moderator"))
 async def add_moderator(message: types.Message) -> None:
+    """Add a moderator to one or more target groups."""
     if not message.from_user:
         return
     target_user_id, group_spec = _parse_target_user_and_groupspec(message)
@@ -1064,6 +1092,7 @@ async def add_moderator(message: types.Message) -> None:
 
 @router.message(Command("remove_moderator"))
 async def remove_moderator(message: types.Message) -> None:
+    """Remove a moderator from one or more target groups."""
     if not message.from_user:
         return
     target_user_id, group_spec = _parse_target_user_and_groupspec(message)
@@ -1083,6 +1112,7 @@ async def remove_moderator(message: types.Message) -> None:
 
 @router.message(Command("list_moderators"))
 async def list_moderators(message: types.Message) -> None:
+    """List moderator ids for one or more groups."""
     if not message.from_user:
         return
     target_groups, err = _resolve_target_groups(message, message.from_user.id, _command_arg(message))
@@ -1094,6 +1124,7 @@ async def list_moderators(message: types.Message) -> None:
 
 @router.message(Command("add_whitelist"))
 async def add_whitelist(message: types.Message) -> None:
+    """Add a user to whitelist in one or more groups."""
     if not message.from_user:
         return
     target_user_id, group_spec = _parse_target_user_and_groupspec(message)
@@ -1111,6 +1142,7 @@ async def add_whitelist(message: types.Message) -> None:
 
 @router.message(Command("remove_whitelist"))
 async def remove_whitelist(message: types.Message) -> None:
+    """Remove a user from whitelist in one or more groups."""
     if not message.from_user:
         return
     target_user_id, group_spec = _parse_target_user_and_groupspec(message)
@@ -1128,6 +1160,7 @@ async def remove_whitelist(message: types.Message) -> None:
 
 @router.message(Command("list_whitelist"))
 async def list_whitelist(message: types.Message) -> None:
+    """List whitelist ids for one or more groups."""
     if not message.from_user:
         return
     target_groups, err = _resolve_target_groups(message, message.from_user.id, _command_arg(message))
@@ -1139,6 +1172,7 @@ async def list_whitelist(message: types.Message) -> None:
 
 @router.message(Command("add_hardword"))
 async def add_hardword(message: types.Message) -> None:
+    """Add a legacy hardword trigger to one or more groups."""
     if not message.from_user:
         return
     raw = _command_arg(message)
@@ -1169,6 +1203,7 @@ async def add_hardword(message: types.Message) -> None:
 
 @router.message(Command("remove_hardword"))
 async def remove_hardword(message: types.Message) -> None:
+    """Remove a legacy hardword trigger from one or more groups."""
     if not message.from_user:
         return
     raw = _command_arg(message)
@@ -1199,6 +1234,7 @@ async def remove_hardword(message: types.Message) -> None:
 
 @router.message(Command("list_hardwords"))
 async def list_hardwords(message: types.Message) -> None:
+    """List legacy hardword triggers for one or more groups."""
     if not message.from_user:
         return
     target_groups, err = _resolve_target_groups(message, message.from_user.id, _command_arg(message))
@@ -1210,6 +1246,7 @@ async def list_hardwords(message: types.Message) -> None:
 
 @router.callback_query(F.data == "menu:groups")
 async def cb_menu_groups(callback: types.CallbackQuery) -> None:
+    """Open or refresh the compact private main menu from callback flow."""
     if not callback.from_user or not callback.message:
         return
     await _set_dynamic_private_commands(callback.message.bot, callback.from_user.id)
@@ -1247,6 +1284,7 @@ async def cb_menu_groups(callback: types.CallbackQuery) -> None:
 
 @router.callback_query(F.data == "menu:add_group_help_global")
 async def cb_menu_add_group_help_global(callback: types.CallbackQuery) -> None:
+    """Show static helper text for adding another group."""
     if not callback.from_user or not callback.message:
         await callback.answer()
         return
@@ -1268,6 +1306,7 @@ async def cb_menu_add_group_help_global(callback: types.CallbackQuery) -> None:
 
 @router.callback_query(F.data == "tunnel:refresh_webapp")
 async def cb_tunnel_refresh_webapp(callback: types.CallbackQuery, bot: Bot) -> None:
+    """Refresh private WebApp entry menus after the tunnel URL changes."""
     if not callback.from_user or not callback.message:
         await callback.answer()
         return
@@ -1292,6 +1331,7 @@ async def cb_tunnel_refresh_webapp(callback: types.CallbackQuery, bot: Bot) -> N
 
 @router.callback_query(F.data.startswith("menu:group:"))
 async def cb_menu_group(callback: types.CallbackQuery) -> None:
+    """Switch selected group in private menu flow."""
     if not callback.from_user or not callback.message:
         return
     parts = callback.data.split(":")
@@ -1323,6 +1363,7 @@ async def cb_menu_group(callback: types.CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("nav:"))
 async def cb_nav_category(callback: types.CallbackQuery) -> None:
+    """Navigate within stacked Telegram alerts for a category."""
     if not callback.from_user or not callback.message:
         await callback.answer()
         return
@@ -1363,11 +1404,13 @@ async def cb_nav_category(callback: types.CallbackQuery) -> None:
 
 @router.callback_query(F.data == "noop")
 async def cb_noop(callback: types.CallbackQuery) -> None:
+    """Acknowledge inert callback buttons."""
     await callback.answer()
 
 
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 async def moderate_message(message: types.Message, bot: Bot) -> None:
+    """Main group-message moderation pipeline for new messages."""
     try:
         group_id = message.chat.id
         if not db.is_group_registered(group_id):
@@ -1574,11 +1617,13 @@ async def moderate_message(message: types.Message, bot: Bot) -> None:
 
 @router.edited_message(F.chat.type.in_({"group", "supergroup"}))
 async def moderate_edited_message(message: types.Message, bot: Bot) -> None:
+    """Run the same moderation pipeline for edited messages."""
     await moderate_message(message, bot)
 
 
 @router.message(F.new_chat_members)
 async def new_member_monitor(message: types.Message) -> None:
+    """Track newly joined users so they become visible in WebApp user lists."""
     if message.chat.type not in {"group", "supergroup"}:
         return
     for user in message.new_chat_members:
@@ -1594,6 +1639,7 @@ async def new_member_monitor(message: types.Message) -> None:
 
 @router.message(F.left_chat_member)
 async def left_member_monitor(message: types.Message) -> None:
+    """Mark users as removed when they leave the group."""
     user = message.left_chat_member
     if not user:
         return
