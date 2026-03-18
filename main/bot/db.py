@@ -1,9 +1,10 @@
 """SQLite persistence layer for groups, ads, alerts and private bot state."""
 
+import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 DB_PATH = Path("main/data/moderation.db")
 
@@ -131,6 +132,18 @@ def init_db() -> None:
                 FOREIGN KEY (ad_id) REFERENCES ads(ad_id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS audit_log (
+                audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                actor_user_id INTEGER,
+                target_user_id INTEGER,
+                group_id INTEGER,
+                ad_id INTEGER,
+                source TEXT NOT NULL,
+                payload_json TEXT,
+                created_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS moderator_alert_state (
                 moderator_id INTEGER NOT NULL,
                 group_id INTEGER NOT NULL,
@@ -190,6 +203,37 @@ def init_db() -> None:
                 """,
                 (int(row["group_id"]), trigger_type, value, int(row["added_by"]), int(row["added_at"]), now),
             )
+
+
+def record_audit_event(
+    event_type: str,
+    source: str,
+    actor_user_id: int | None = None,
+    target_user_id: int | None = None,
+    group_id: int | None = None,
+    ad_id: int | None = None,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """Persist a structured audit trail entry for a significant state-changing event."""
+    payload_json = None
+    if payload:
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_log(
+                event_type,
+                actor_user_id,
+                target_user_id,
+                group_id,
+                ad_id,
+                source,
+                payload_json,
+                created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (event_type, actor_user_id, target_user_id, group_id, ad_id, source, payload_json, _now()),
+        )
 
 
 def register_group(group_id: int, title: str, created_by: int) -> bool:

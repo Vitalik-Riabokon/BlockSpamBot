@@ -21,6 +21,7 @@ from .config import (
     TUNNEL_LOG_POLL_SECONDS,
     TUNNEL_NOTIFY_USER_ID,
 )
+from .logging_utils import emit_structured_log
 
 STATE_PATH = Path("main/data/tunnel_notifier_state.json")
 LOG_PATH = Path(TUNNEL_LOG_PATH)
@@ -107,7 +108,13 @@ async def _send_tunnel_update(bot: Bot, url: str) -> None:
         disable_notification=False,
     )
     db.track_private_bot_message(TUNNEL_NOTIFY_USER_ID, TUNNEL_NOTIFY_USER_ID, sent.message_id, "tunnel_update")
-    logging.info("Sent tunnel URL update to user %s: %s", TUNNEL_NOTIFY_USER_ID, url)
+    emit_structured_log(
+        "tunnel_url_notified",
+        logger_name=__name__,
+        target_user_id=TUNNEL_NOTIFY_USER_ID,
+        url=url,
+        domain=domain,
+    )
 
 
 async def _handle_discovered_url(bot: Bot, current_url: str, last_url: str) -> str:
@@ -125,7 +132,7 @@ async def _handle_discovered_url(bot: Bot, current_url: str, last_url: str) -> s
 
 async def _watch_cloudflared_log(bot: Bot) -> None:
     """Watch an external cloudflared log file and react to discovered tunnel URLs."""
-    logging.info("cloudflared auto-start disabled; watching log file: %s", LOG_PATH)
+    emit_structured_log("cloudflared_log_watch_started", logger_name=__name__, log_path=str(LOG_PATH))
     last_url = _load_last_url()
     last_position = 0
 
@@ -170,7 +177,12 @@ async def run_cloudflared_tunnel(bot: Bot, restart_delay_seconds: int = 3) -> No
     while True:
         process = None
         try:
-            logging.info("Starting cloudflared: %s tunnel --url %s --no-autoupdate", binary, CLOUDFLARED_TARGET_URL)
+            emit_structured_log(
+                "cloudflared_starting",
+                logger_name=__name__,
+                binary=binary,
+                target_url=CLOUDFLARED_TARGET_URL,
+            )
             LOG_PATH.write_text("", encoding="utf-8")
             process = await asyncio.create_subprocess_exec(
                 binary,
@@ -191,13 +203,18 @@ async def run_cloudflared_tunnel(bot: Bot, restart_delay_seconds: int = 3) -> No
                 if line:
                     with LOG_PATH.open("a", encoding="utf-8") as fh:
                         fh.write(line + "\n")
-                    logging.info("cloudflared: %s", line)
+                    emit_structured_log("cloudflared_output", logger_name=__name__, line=line)
                     match = TUNNEL_URL_REGEX.search(line)
                     if match:
                         last_url = await _handle_discovered_url(bot, match.group(0).strip(), last_url)
 
             exit_code = await process.wait()
-            logging.warning("cloudflared exited with code %s", exit_code)
+            emit_structured_log(
+                "cloudflared_exited",
+                level=logging.WARNING,
+                logger_name=__name__,
+                exit_code=exit_code,
+            )
         except asyncio.CancelledError:
             if process and process.returncode is None:
                 process.terminate()

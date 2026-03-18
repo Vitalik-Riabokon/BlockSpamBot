@@ -16,6 +16,7 @@ from . import config, db, state
 from .actions import apply_permanent_mute, apply_unmute, delete_message_safe
 from .config import BOT_TOKEN
 from .handlers import CATEGORY_LABELS, _refresh_alerts_for_group
+from .logging_utils import emit_structured_log
 
 WEBAPP_DIR = Path(__file__).resolve().parent.parent / "webapp"
 WORD_TRIGGER_RE = re.compile(r"^[A-Za-zА-Яа-яІіЇїЄєҐґЁё'’\s]+$")
@@ -350,6 +351,28 @@ async def _api_ads_action(request: web.Request) -> web.Response:
             category="blocked",
         )
 
+    db.record_audit_event(
+        event_type="webapp_ad_action",
+        source="webapp",
+        actor_user_id=user_id,
+        target_user_id=int(ad["user_id"]),
+        group_id=group_id,
+        ad_id=ad_id,
+        payload={
+            "action": action,
+            "previous_category": str(ad["category"]),
+            "previous_decision": str(ad["decision"]),
+        },
+    )
+    emit_structured_log(
+        "webapp_ad_action",
+        logger_name=__name__,
+        actor_user_id=user_id,
+        target_user_id=int(ad["user_id"]),
+        group_id=group_id,
+        ad_id=ad_id,
+        action=action,
+    )
     await _refresh_group_alerts(bot, group_id)
     updated = db.get_ad(ad_id)
     return web.json_response({"ok": True, "counts": db.get_unresolved_counts(group_id), "item": _serialize_ad(updated) if updated else None})
@@ -383,6 +406,21 @@ async def _api_ads_confirm_all(request: web.Request) -> web.Response:
     else:
         updated = db.confirm_all(group_id, category, user_id)
 
+    db.record_audit_event(
+        event_type="webapp_confirm_all",
+        source="webapp",
+        actor_user_id=user_id,
+        group_id=group_id,
+        payload={"category": category, "updated": updated},
+    )
+    emit_structured_log(
+        "webapp_confirm_all",
+        logger_name=__name__,
+        actor_user_id=user_id,
+        group_id=group_id,
+        category=category,
+        updated=updated,
+    )
     await _refresh_group_alerts(bot, group_id)
     return web.json_response({"ok": True, "updated": updated, "counts": db.get_unresolved_counts(group_id)})
 
@@ -468,6 +506,16 @@ async def _api_settings_toggle(request: web.Request) -> web.Response:
         db.set_hide_confirmed_blocked(group_id, not db.get_hide_confirmed_blocked(group_id))
 
     group = db.get_group(group_id)
+    db.record_audit_event(
+        event_type="webapp_group_setting_toggled",
+        source="webapp",
+        actor_user_id=user_id,
+        group_id=group_id,
+        payload={
+            "setting": setting,
+            "new_value": bool(group[setting]) if group and setting in group.keys() else None,
+        },
+    )
     return web.json_response(
         {
             "ok": True,
@@ -543,6 +591,13 @@ async def _api_add_trigger(request: web.Request) -> web.Response:
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
 
+    db.record_audit_event(
+        event_type="webapp_trigger_added",
+        source="webapp",
+        actor_user_id=user_id,
+        group_id=group_id,
+        payload={"trigger_type": trigger_type, "value": value},
+    )
     rows = db.list_group_triggers(group_id, trigger_type)
     return web.json_response(
         {
@@ -584,6 +639,13 @@ async def _api_update_trigger(request: web.Request) -> web.Response:
     if not ok:
         return web.json_response({"error": "trigger not found"}, status=404)
 
+    db.record_audit_event(
+        event_type="webapp_trigger_updated",
+        source="webapp",
+        actor_user_id=user_id,
+        group_id=group_id,
+        payload={"trigger_id": trigger_id, "trigger_type": trigger_type, "value": normalized},
+    )
     return web.json_response({"ok": True})
 
 
@@ -603,6 +665,13 @@ async def _api_delete_trigger(request: web.Request) -> web.Response:
     ok = db.delete_group_trigger(group_id, trigger_id)
     if not ok:
         return web.json_response({"error": "trigger not found"}, status=404)
+    db.record_audit_event(
+        event_type="webapp_trigger_deleted",
+        source="webapp",
+        actor_user_id=user_id,
+        group_id=group_id,
+        payload={"trigger_id": trigger_id},
+    )
     return web.json_response({"ok": True})
 
 
@@ -624,6 +693,13 @@ async def _api_grant(request: web.Request) -> web.Response:
         return web.json_response({"error": "forbidden"}, status=403)
 
     db.add_whitelist(group_id, target_user_id, user_id)
+    db.record_audit_event(
+        event_type="webapp_whitelist_granted",
+        source="webapp",
+        actor_user_id=user_id,
+        target_user_id=target_user_id,
+        group_id=group_id,
+    )
     return web.json_response({"ok": True})
 
 
@@ -648,6 +724,13 @@ async def _api_add_moderator(request: web.Request) -> web.Response:
         return web.json_response({"error": "forbidden"}, status=403)
 
     db.add_moderator(group_id, target_user_id, user_id)
+    db.record_audit_event(
+        event_type="webapp_moderator_added",
+        source="webapp",
+        actor_user_id=user_id,
+        target_user_id=target_user_id,
+        group_id=group_id,
+    )
     return web.json_response({"ok": True})
 
 
@@ -702,6 +785,14 @@ async def _api_remove_moderator(request: web.Request) -> web.Response:
     ok, text = db.remove_moderator(group_id, target_user_id, user_id)
     if not ok:
         return web.json_response({"error": text}, status=400)
+    db.record_audit_event(
+        event_type="webapp_moderator_removed",
+        source="webapp",
+        actor_user_id=user_id,
+        target_user_id=target_user_id,
+        group_id=group_id,
+        payload={"message": text},
+    )
     return web.json_response({"ok": True, "message": text})
 
 
@@ -723,6 +814,13 @@ async def _api_revoke(request: web.Request) -> web.Response:
         return web.json_response({"error": "forbidden"}, status=403)
 
     db.remove_whitelist(group_id, target_user_id)
+    db.record_audit_event(
+        event_type="webapp_whitelist_revoked",
+        source="webapp",
+        actor_user_id=user_id,
+        target_user_id=target_user_id,
+        group_id=group_id,
+    )
     return web.json_response({"ok": True})
 
 

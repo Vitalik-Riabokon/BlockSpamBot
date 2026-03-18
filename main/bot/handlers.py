@@ -23,6 +23,7 @@ from .classifier import (
     normalize_text_for_match,
 )
 from .models import GroupPolicy, ModerationResult, ModerationStatus
+from .logging_utils import emit_structured_log
 from .rules import CTA_KEYWORDS, SCAM_JOB_KEYWORDS, mention_regex, phone_regex
 from .tunnel_notifier import get_public_webapp_base_url
 from .config import TUNNEL_NOTIFY_USER_ID
@@ -855,6 +856,13 @@ async def register_group(message: types.Message, bot: Bot) -> None:
         status="in_group",
     )
     db.upsert_group_user(message.chat.id, message.from_user.id)
+    db.record_audit_event(
+        event_type="telegram_group_registered",
+        source="telegram",
+        actor_user_id=message.from_user.id,
+        group_id=message.chat.id,
+        payload={"created": created, "title": message.chat.title or str(message.chat.id)},
+    )
     if created:
         await _send_context_message(message, "✅ Група зареєстрована. Ви додані як модератор цієї групи.")
     else:
@@ -881,6 +889,13 @@ async def delete_group(message: types.Message, bot: Bot) -> None:
     if not ok:
         await _send_context_message(message, f"⛔ {text}")
         return
+    db.record_audit_event(
+        event_type="telegram_group_deleted",
+        source="telegram",
+        actor_user_id=message.from_user.id,
+        group_id=target_group_id,
+        payload={"message": text},
+    )
     await _send_context_message(message, f"✅ {text}")
     try:
         await bot.leave_chat(target_group_id)
@@ -901,10 +916,29 @@ async def bot_membership_changed(event: types.ChatMemberUpdated) -> None:
         if actor:
             if not db.is_group_registered(event.chat.id):
                 db.register_group(event.chat.id, event.chat.title or str(event.chat.id), actor.id)
-                logging.info("Auto-registered group %s by user %s", event.chat.id, actor.id)
+                db.record_audit_event(
+                    event_type="telegram_group_auto_registered",
+                    source="telegram",
+                    actor_user_id=actor.id,
+                    group_id=event.chat.id,
+                    payload={"title": event.chat.title or str(event.chat.id)},
+                )
+                emit_structured_log(
+                    "telegram_group_auto_registered",
+                    logger_name=__name__,
+                    actor_user_id=actor.id,
+                    group_id=event.chat.id,
+                )
             elif db.is_moderator(event.chat.id, actor.id):
                 db.register_group(event.chat.id, event.chat.title or str(event.chat.id), actor.id)
     if new_status in {"left", "kicked"}:
+        db.record_audit_event(
+            event_type="telegram_group_deactivated",
+            source="telegram",
+            actor_user_id=event.from_user.id if event.from_user else None,
+            group_id=event.chat.id,
+            payload={"old_status": old_status, "new_status": new_status},
+        )
         db.delete_group_force(event.chat.id)
         logging.info("Group %s deactivated because bot left/was removed", event.chat.id)
 
@@ -953,6 +987,13 @@ async def pause_group(message: types.Message) -> None:
         paused_now = db.is_group_paused(gid)
         new_value = not paused_now
         db.set_group_paused(gid, new_value)
+        db.record_audit_event(
+            event_type="telegram_group_pause_toggled",
+            source="telegram",
+            actor_user_id=message.from_user.id,
+            group_id=gid,
+            payload={"is_paused": new_value},
+        )
         statuses.append(f"{gid}: {'вимкнено' if new_value else 'увімкнено'}")
     await _set_dynamic_private_commands(message.bot, message.from_user.id)
     await _send_context_message(message, f"✅ Стан модерації груп: {', '.join(statuses)}")
@@ -969,6 +1010,13 @@ async def resume_group(message: types.Message) -> None:
         return
     for gid in target_groups:
         db.set_group_paused(gid, False)
+        db.record_audit_event(
+            event_type="telegram_group_resumed",
+            source="telegram",
+            actor_user_id=message.from_user.id,
+            group_id=gid,
+            payload={"is_paused": False},
+        )
     await _set_dynamic_private_commands(message.bot, message.from_user.id)
     await _send_context_message(message, f"✅ Модерація відновлена для group_id: {target_groups}")
 
@@ -994,6 +1042,13 @@ async def set_pending_alerts(message: types.Message) -> None:
         return
     for gid in target_groups:
         db.set_notify_pending(gid, parsed)
+        db.record_audit_event(
+            event_type="telegram_pending_alerts_set",
+            source="telegram",
+            actor_user_id=message.from_user.id,
+            group_id=gid,
+            payload={"enabled": parsed},
+        )
     await _set_dynamic_private_commands(message.bot, message.from_user.id)
     await _send_context_message(message, f"✅ Сповіщення для адекватних, не підтверджених: {'увімкнено' if parsed else 'вимкнено'} для {target_groups}")
 
@@ -1019,6 +1074,13 @@ async def set_blocked_sound(message: types.Message) -> None:
         return
     for gid in target_groups:
         db.set_blocked_alert_sound(gid, parsed)
+        db.record_audit_event(
+            event_type="telegram_blocked_sound_set",
+            source="telegram",
+            actor_user_id=message.from_user.id,
+            group_id=gid,
+            payload={"enabled": parsed},
+        )
     await _set_dynamic_private_commands(message.bot, message.from_user.id)
     await _send_context_message(message, f"✅ Звук для авто-блокувань: {'увімкнено' if parsed else 'вимкнено'} для {target_groups}")
 
@@ -1042,6 +1104,13 @@ async def toggle_pending_command(message: types.Message) -> None:
         return
     new_value = not db.get_notify_pending(group_id)
     db.set_notify_pending(group_id, new_value)
+    db.record_audit_event(
+        event_type="telegram_pending_alerts_toggled",
+        source="telegram",
+        actor_user_id=message.from_user.id,
+        group_id=group_id,
+        payload={"enabled": new_value},
+    )
     await _set_dynamic_private_commands(message.bot, message.from_user.id)
     await _send_context_message(
         message,
@@ -1062,6 +1131,13 @@ async def toggle_blocked_sound_command(message: types.Message) -> None:
         return
     new_value = not db.get_blocked_alert_sound(group_id)
     db.set_blocked_alert_sound(group_id, new_value)
+    db.record_audit_event(
+        event_type="telegram_blocked_sound_toggled",
+        source="telegram",
+        actor_user_id=message.from_user.id,
+        group_id=group_id,
+        payload={"enabled": new_value},
+    )
     await _set_dynamic_private_commands(message.bot, message.from_user.id)
     await _send_context_message(
         message,
@@ -1084,6 +1160,13 @@ async def add_moderator(message: types.Message) -> None:
         return
     for gid in target_groups:
         db.add_moderator(gid, target_user_id, message.from_user.id)
+        db.record_audit_event(
+            event_type="telegram_moderator_added",
+            source="telegram",
+            actor_user_id=message.from_user.id,
+            target_user_id=target_user_id,
+            group_id=gid,
+        )
     await _send_context_message(message, 
         f"✅ Додано модератора {target_user_id} у group_id: {target_groups}\n"
         "Нагадування: модератор має запустити /start у приваті з ботом."
@@ -1106,6 +1189,15 @@ async def remove_moderator(message: types.Message) -> None:
     results = []
     for gid in target_groups:
         ok, text = db.remove_moderator(gid, target_user_id, message.from_user.id)
+        if ok:
+            db.record_audit_event(
+                event_type="telegram_moderator_removed",
+                source="telegram",
+                actor_user_id=message.from_user.id,
+                target_user_id=target_user_id,
+                group_id=gid,
+                payload={"message": text},
+            )
         results.append(f"група {gid}: {'ok' if ok else 'помилка'} ({text})")
     await _send_context_message(message, "\n".join(results))
 
@@ -1137,6 +1229,13 @@ async def add_whitelist(message: types.Message) -> None:
         return
     for gid in target_groups:
         db.add_whitelist(gid, target_user_id, message.from_user.id)
+        db.record_audit_event(
+            event_type="telegram_whitelist_granted",
+            source="telegram",
+            actor_user_id=message.from_user.id,
+            target_user_id=target_user_id,
+            group_id=gid,
+        )
     await _send_context_message(message, f"✅ Додано у whitelist {target_user_id} для group_id: {target_groups}")
 
 
@@ -1155,6 +1254,13 @@ async def remove_whitelist(message: types.Message) -> None:
         return
     for gid in target_groups:
         db.remove_whitelist(gid, target_user_id)
+        db.record_audit_event(
+            event_type="telegram_whitelist_revoked",
+            source="telegram",
+            actor_user_id=message.from_user.id,
+            target_user_id=target_user_id,
+            group_id=gid,
+        )
     await _send_context_message(message, f"✅ Видалено з whitelist {target_user_id} для group_id: {target_groups}")
 
 
@@ -1198,6 +1304,13 @@ async def add_hardword(message: types.Message) -> None:
         return
     for gid in target_groups:
         db.add_hardword(gid, word, message.from_user.id)
+        db.record_audit_event(
+            event_type="telegram_legacy_trigger_added",
+            source="telegram",
+            actor_user_id=message.from_user.id,
+            group_id=gid,
+            payload={"value": word},
+        )
     await _send_context_message(message, f"✅ hardword додано: '{word}' для group_id: {target_groups}")
 
 
@@ -1229,6 +1342,13 @@ async def remove_hardword(message: types.Message) -> None:
         return
     for gid in target_groups:
         db.remove_hardword(gid, word)
+        db.record_audit_event(
+            event_type="telegram_legacy_trigger_removed",
+            source="telegram",
+            actor_user_id=message.from_user.id,
+            group_id=gid,
+            payload={"value": word},
+        )
     await _send_context_message(message, f"✅ hardword видалено: '{word}' для group_id: {target_groups}")
 
 
@@ -1490,7 +1610,7 @@ async def moderate_message(message: types.Message, bot: Bot) -> None:
 
         if result.status == ModerationStatus.AD_BLOCKED:
             if in_whitelist and not hard_block_hit and not split_force_block and not duplicate_block_hit:
-                db.create_ad(
+                ad_id = db.create_ad(
                     group_id=group_id,
                     user_id=author.id,
                     source_chat_id=message.chat.id,
@@ -1500,6 +1620,15 @@ async def moderate_message(message: types.Message, bot: Bot) -> None:
                     category="confirmed",
                     decision="pending",
                     requires_action=True,
+                )
+                db.record_audit_event(
+                    event_type="moderation_confirmed_created",
+                    source="system",
+                    actor_user_id=author.id,
+                    target_user_id=author.id,
+                    group_id=group_id,
+                    ad_id=ad_id,
+                    payload={"message_id": message.message_id, "reasons": result.reasons},
                 )
                 await log_action(message.chat, author, message, result)
                 return
@@ -1525,6 +1654,20 @@ async def moderate_message(message: types.Message, bot: Bot) -> None:
                 requires_action=True,
             )
             state.add_strike(group_id, author.id)
+            db.record_audit_event(
+                event_type="moderation_blocked_created",
+                source="system",
+                actor_user_id=author.id,
+                target_user_id=author.id,
+                group_id=group_id,
+                ad_id=ad_id,
+                payload={
+                    "message_id": message.message_id,
+                    "decision": "muted_auto" if can_enforce else "would_block",
+                    "reasons": result.reasons,
+                    "split_force_block": split_force_block,
+                },
+            )
             if can_enforce:
                 await apply_block_action(bot, group_id, message.chat, author, message, result, ad_id=ad_id)
             else:
@@ -1561,11 +1704,20 @@ async def moderate_message(message: types.Message, bot: Bot) -> None:
                     requires_action=True,
                 )
                 state.add_strike(group_id, author.id)
+                db.record_audit_event(
+                    event_type="moderation_suspect_escalated",
+                    source="system",
+                    actor_user_id=author.id,
+                    target_user_id=author.id,
+                    group_id=group_id,
+                    ad_id=ad_id,
+                    payload={"message_id": message.message_id, "reasons": escalated.reasons},
+                )
                 await apply_block_action(bot, group_id, message.chat, author, message, escalated, ad_id=ad_id)
                 await _refresh_alerts_for_group(bot, group_id, "blocked")
                 return
 
-            db.create_ad(
+            ad_id = db.create_ad(
                 group_id=group_id,
                 user_id=author.id,
                 source_chat_id=message.chat.id,
@@ -1576,12 +1728,21 @@ async def moderate_message(message: types.Message, bot: Bot) -> None:
                 decision="pending",
                 requires_action=True,
             )
+            db.record_audit_event(
+                event_type="moderation_suspect_created",
+                source="system",
+                actor_user_id=author.id,
+                target_user_id=author.id,
+                group_id=group_id,
+                ad_id=ad_id,
+                payload={"message_id": message.message_id, "reasons": result.reasons},
+            )
             await log_action(message.chat, author, message, result)
             await _refresh_alerts_for_group(bot, group_id, "suspect")
             return
 
         if result.status == ModerationStatus.AD_PENDING_AUTH:
-            db.create_ad(
+            ad_id = db.create_ad(
                 group_id=group_id,
                 user_id=author.id,
                 source_chat_id=message.chat.id,
@@ -1592,13 +1753,22 @@ async def moderate_message(message: types.Message, bot: Bot) -> None:
                 decision="pending",
                 requires_action=True,
             )
+            db.record_audit_event(
+                event_type="moderation_pending_created",
+                source="system",
+                actor_user_id=author.id,
+                target_user_id=author.id,
+                group_id=group_id,
+                ad_id=ad_id,
+                payload={"message_id": message.message_id, "reasons": result.reasons},
+            )
             await log_action(message.chat, author, message, result)
             if db.get_notify_pending(group_id):
                 await _refresh_alerts_for_group(bot, group_id, "pending")
             return
 
         if result.status == ModerationStatus.AD_ALLOWED:
-            db.create_ad(
+            ad_id = db.create_ad(
                 group_id=group_id,
                 user_id=author.id,
                 source_chat_id=message.chat.id,
@@ -1609,9 +1779,26 @@ async def moderate_message(message: types.Message, bot: Bot) -> None:
                 decision="pending",
                 requires_action=True,
             )
+            db.record_audit_event(
+                event_type="moderation_allowed_created",
+                source="system",
+                actor_user_id=author.id,
+                target_user_id=author.id,
+                group_id=group_id,
+                ad_id=ad_id,
+                payload={"message_id": message.message_id, "reasons": result.reasons},
+            )
             await log_action(message.chat, author, message, result)
             return
     except Exception:
+        emit_structured_log(
+            "moderation_pipeline_error",
+            level=logging.ERROR,
+            logger_name=__name__,
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            user_id=message.from_user.id if message.from_user else None,
+        )
         logging.exception("Помилка в moderate_message")
 
 

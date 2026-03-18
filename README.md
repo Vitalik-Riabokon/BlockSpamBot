@@ -41,12 +41,37 @@ Production layout:
 
 - `bot` - Telegram bot + WebApp backend
 - `cloudflared` - tunnel sidecar
+- `prometheus` - metrics storage
+- `grafana` - dashboards
+- `docker-metrics-exporter` - Docker container metrics on Windows / Docker Desktop
+- `cadvisor` - Linux-only container metrics
+- `node-exporter` - Linux-only host machine metrics
 
 ### Start
 
 1. Fill `.env`
 2. Run:
    - `docker compose up -d --build`
+
+### Full production observability on Windows / Docker Desktop
+
+To run the practical full monitoring stack on Windows:
+
+- `docker compose --profile monitoring up -d --build`
+
+This starts:
+
+- `bot`
+- `cloudflared`
+- `prometheus`
+- `grafana`
+- `docker-metrics-exporter`
+
+Important:
+
+- this gives full bot/runtime/audit visibility plus container load visibility for Docker services
+- it does not provide true Linux host-level metrics of the future production server
+- when you later move to Linux, enable the separate Linux monitoring services too
 
 ### Stop
 
@@ -65,6 +90,33 @@ Production layout:
 - `docker compose ps`
 - `docker compose logs bot --tail=100`
 - `docker compose logs cloudflared --tail=100`
+- `docker compose --profile monitoring ps`
+- `docker compose --profile monitoring logs prometheus --tail=100`
+- `docker compose --profile monitoring logs grafana --tail=100`
+- `docker compose --profile monitoring logs docker-metrics-exporter --tail=100`
+
+### Monitoring URLs
+
+After starting the monitoring profile on the server:
+
+- Grafana: `http://SERVER_IP:3000`
+- Prometheus: `http://SERVER_IP:9090`
+- Docker metrics exporter: `http://SERVER_IP:9200/metrics`
+
+Grafana defaults:
+
+- user: `admin`
+- password: `admin`
+
+Change the Grafana credentials in `.env` before production use:
+
+- `GRAFANA_ADMIN_USER`
+- `GRAFANA_ADMIN_PASSWORD`
+
+Grafana is provisioned automatically with:
+
+- Prometheus datasource
+- `BayreuthUkraine Monitoring` dashboard
 
 ### Deploy flow after tunnel URL changes
 
@@ -96,8 +148,54 @@ If you suspect another instance is still using the bot token:
 - `CLOUDFLARED_TARGET_URL` - target URL for cloudflared in local mode
 - `TUNNEL_LOG_PATH` - shared tunnel log path
 - `BOT_LOCK_PATH` - process lock file path
+- `GRAFANA_ADMIN_USER`, `GRAFANA_ADMIN_PASSWORD` - Grafana login
+- `GRAFANA_ROOT_URL` - external Grafana URL
+- `PROMETHEUS_RETENTION_TIME` - metrics retention period
 - `SPLIT_WINDOW_SECONDS`, `SPLIT_MAX_MESSAGES` - split-message ad detection window
 - `AD_DUPLICATE_BLOCK_WINDOW_SECONDS`, `AD_DUPLICATE_BLOCK_COUNT` - duplicate-ad hard block heuristics
+
+## Logging and observability
+
+What is available after deployment:
+
+1. Bot runtime logs
+- `docker compose logs bot -f`
+- structured JSON logs
+
+2. Internal audit trail
+- SQLite table `audit_log`
+- covers:
+  - moderator changes
+  - whitelist changes
+  - trigger CRUD
+  - group setting toggles
+  - moderation actions
+
+3. Container and host metrics
+- `docker-metrics-exporter` for container CPU/RAM/network/restarts/health on Windows
+- `prometheus` for metrics retention
+- `grafana` for dashboards
+
+This means: moving the project to a server is not just “start the bot”.
+
+For full logging and monitoring on the server you should:
+
+1. Fill `.env`
+2. Run:
+   - `docker compose --profile monitoring up -d --build`
+3. Set `BotFather /setdomain` to the current tunnel domain
+4. Open Grafana and verify metrics
+
+## Linux upgrade path later
+
+When you move to a real Linux server, the next monitoring step is:
+
+- enable `cadvisor`
+- enable `node-exporter`
+- extend Prometheus scrape config
+- add Linux host dashboards
+
+That part is intentionally separate from the current Windows setup.
 
 ## Runtime behavior
 

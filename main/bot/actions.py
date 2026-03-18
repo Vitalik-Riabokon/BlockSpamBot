@@ -7,20 +7,21 @@ from aiogram import Bot, types
 from aiogram.exceptions import TelegramAPIError
 
 from . import config, db
+from .logging_utils import emit_structured_log
 from .models import ModerationResult
 
 
 async def log_action(chat: types.Chat, author: types.User, message: types.Message, result: ModerationResult) -> None:
     """Write a moderation decision to application logs."""
-    reason = ", ".join(result.reasons)
-    logging.info(
-        "Moderation: status=%s score=%s user=%s chat=%s msg_id=%s reasons=%s",
-        result.status.value,
-        result.score,
-        author.id,
-        chat.id,
-        message.message_id,
-        reason,
+    emit_structured_log(
+        "moderation_result",
+        logger_name=__name__,
+        status=result.status.value,
+        score=result.score,
+        user_id=author.id,
+        chat_id=chat.id,
+        message_id=message.message_id,
+        reasons=result.reasons,
     )
 
 
@@ -28,6 +29,12 @@ async def delete_message_safe(bot: Bot, chat_id: int, message_id: int) -> bool:
     """Delete a Telegram message and suppress API errors into a boolean result."""
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        emit_structured_log(
+            "telegram_delete_message_ok",
+            logger_name=__name__,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
         return True
     except TelegramAPIError:
         logging.exception("Failed to delete message chat_id=%s msg_id=%s", chat_id, message_id)
@@ -43,6 +50,13 @@ async def apply_permanent_mute(bot: Bot, chat_id: int, user_id: int) -> bool:
             permissions=types.ChatPermissions(can_send_messages=False),
         )
         db.set_user_status(user_id, "mute_permanent")
+        emit_structured_log(
+            "telegram_restrict_user_ok",
+            logger_name=__name__,
+            chat_id=chat_id,
+            user_id=user_id,
+            restriction="mute_permanent",
+        )
         return True
     except TelegramAPIError:
         logging.exception("Failed to restrict user %s in chat %s", user_id, chat_id)
@@ -72,6 +86,12 @@ async def apply_unmute(bot: Bot, chat_id: int, user_id: int) -> bool:
             ),
         )
         db.set_user_status(user_id, "in_group")
+        emit_structured_log(
+            "telegram_unmute_user_ok",
+            logger_name=__name__,
+            chat_id=chat_id,
+            user_id=user_id,
+        )
         return True
     except TelegramAPIError:
         logging.exception("Failed to unmute user %s in chat %s", user_id, chat_id)
@@ -102,4 +122,18 @@ async def apply_block_action(
             requires_action=True,
             category="blocked",
             note="automatic block action",
+        )
+        db.record_audit_event(
+            event_type="auto_block_applied",
+            source="telegram",
+            actor_user_id=None,
+            target_user_id=author.id,
+            group_id=group_id,
+            ad_id=ad_id,
+            payload={
+                "chat_id": chat.id,
+                "message_id": message.message_id,
+                "test_mode": config.TEST_MODE,
+                "reasons": result.reasons,
+            },
         )

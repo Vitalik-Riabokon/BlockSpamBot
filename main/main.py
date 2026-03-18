@@ -11,6 +11,7 @@ from aiogram import Bot, Dispatcher, types
 from bot.config import BOT_LOCK_PATH, BOT_TOKEN, TEST_MODE, WEBAPP_HOST, WEBAPP_PORT
 from bot.db import init_db
 from bot.handlers import periodic_private_context_cleanup, router
+from bot.logging_utils import configure_logging, emit_structured_log
 from bot.tunnel_notifier import get_public_webapp_base_url, run_cloudflared_tunnel
 from bot.webapp_server import start_webapp_server
 
@@ -64,11 +65,17 @@ def release_lock(fd: int) -> None:
 
 async def main() -> None:
     """Start database, WebApp server, Telegram polling and background tasks."""
-    logging.basicConfig(level=logging.INFO)
+    configure_logging(logging.INFO)
     init_db()
     bot = Bot(token=BOT_TOKEN)
     web_runner, _web_site = await start_webapp_server(bot, WEBAPP_HOST, WEBAPP_PORT)
-    logging.info("WebApp server started on http://%s:%s/webapp", WEBAPP_HOST, WEBAPP_PORT)
+    emit_structured_log(
+        "webapp_server_started",
+        logger_name=__name__,
+        host=WEBAPP_HOST,
+        port=WEBAPP_PORT,
+        url=f"http://{WEBAPP_HOST}:{WEBAPP_PORT}/webapp",
+    )
     base = get_public_webapp_base_url()
     if base:
         await bot.set_chat_menu_button(
@@ -87,7 +94,7 @@ async def main() -> None:
     cleanup_task = asyncio.create_task(periodic_private_context_cleanup(bot))
     cloudflared_task = asyncio.create_task(run_cloudflared_tunnel(bot))
 
-    logging.info("Bot started. TEST_MODE = %s", TEST_MODE)
+    emit_structured_log("bot_started", logger_name=__name__, test_mode=TEST_MODE)
     try:
         await dp.start_polling(bot)
     finally:

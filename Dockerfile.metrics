@@ -1,0 +1,10 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY monitoring/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+COPY monitoring/docker_metrics_exporter.py /app/docker_metrics_exporter.py
+
+CMD ["python", "/app/docker_metrics_exporter.py"]
